@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # build.bat auto-detects Visual Studio via vcvarsall.bat
+      # (Enterprise/Professional/Community/BuildTools, VS 2022 and 2026 paths).
+      # windows-latest ships VS 2022 Enterprise at
+      # C:\Program Files\Microsoft Visual Studio\2022\Enterprise, which the
+      # script's detection loop covers. CMake (for lib/zlib-ng) and git (for
+      # test fixture regeneration) are preinstalled on the runner.
+      - name: Build (Release)
+        shell: cmd
+        run: .\build.bat
+
+      # Reuses the zlib-ng library built by the previous step. build.bat
+      # propagates failures via `exit /b 1` (build errors) and
+      # `exit /b !ERRORLEVEL!` (test run), so a nonzero exit fails this step.
+      - name: Run tests
+        shell: cmd
+        run: .\build.bat test

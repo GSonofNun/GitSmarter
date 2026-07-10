@@ -1,0 +1,76 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": ".\\build.bat",  // Your script's filename—rename it to build.bat if needed
+            "args": [],  // Add args like ["clean"] if you want variants
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": "$msCompile",  // Catches MSVC errors/warnings in the Problems panel
+            "detail": "Build GitSmarter.exe using MSVC"
+        },
+        {
+            "label": "clean",
+            "type": "shell",
+            "command": ".\\build.bat",
+            "args": ["clean"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "rebuild",
+            "type": "shell",
+            "command": ".\\build.bat",
+            "args": ["rebuild"],
+            "dependsOn": "clean",
+            "group": "build",
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "debug",
+            "type": "shell",
+            "command": ".\\build.bat",
+            "args": ["debug"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": "$msCompile",
+            "detail": "Build GitSmarterDebug.exe with debug symbols"
+        },
+        {
+            "label": "build-tests",
+            "type": "shell",
+            "command": ".\\build.bat",
+            "args": ["test", "--build-only"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": "$msCompile",
+            "detail": "Build GitSmarterTest.exe with debug symbols"
+        }
+    ]
+}
