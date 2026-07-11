@@ -80,6 +80,10 @@ for %%p in (
     "C:\Program Files\Microsoft Visual Studio\2022\Professional"
     "C:\Program Files\Microsoft Visual Studio\2022\Community"
     "C:\Program Files\Microsoft Visual Studio\2022\BuildTools"
+    "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise"
+    "C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional"
+    "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community"
+    "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
 ) do (
     if exist "%%~p\VC\Auxiliary\Build\vcvarsall.bat" (
         set "VS_PATH=%%~p"
