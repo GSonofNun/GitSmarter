@@ -131,6 +131,12 @@ size_t read_file(const wchar_t* path, char* buffer, size_t buffer_size) {
 size_t zlib_decompress(const void* compressed, size_t compressed_size,
                        void* output, size_t output_size) {
     if (!compressed || !output || compressed_size == 0 || output_size == 0) return 0;
+    // zlib avail_in/avail_out are uInt (32-bit on MSVC). Sizes that do not fit
+    // would truncate (e.g. 4GiB → 0) and silently mis-inflate.
+    if (compressed_size > static_cast<size_t>(UINT_MAX) ||
+        output_size > static_cast<size_t>(UINT_MAX)) {
+        return 0;
+    }
     z_stream strm = {};
     strm.next_in = static_cast<Bytef*>(const_cast<void*>(compressed));
     strm.avail_in = static_cast<uInt>(compressed_size);
@@ -160,6 +166,10 @@ size_t zlib_decompress(const void* compressed, size_t compressed_size,
 size_t zlib_compress(const void* input, size_t input_size,
                      void* output, size_t output_size) {
     if (!input || !output || input_size == 0 || output_size == 0) return 0;
+    if (input_size > static_cast<size_t>(UINT_MAX) ||
+        output_size > static_cast<size_t>(UINT_MAX)) {
+        return 0;
+    }
     z_stream strm = {};
     strm.next_in = static_cast<Bytef*>(const_cast<void*>(input));
     strm.avail_in = static_cast<uInt>(input_size);

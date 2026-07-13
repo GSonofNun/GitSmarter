@@ -34,6 +34,86 @@ static void strip_trailing(char* str) {
     }
 }
 
+// Look up a full ref name (e.g. "refs/heads/main") in packed-refs via mmap.
+// Avoids fixed-buffer truncation used by older readers.
+// out_sha must hold at least Git::SHA1_HEX_SIZE + 1 bytes.
+static bool packed_refs_lookup_sha(const wchar_t* git_dir, const char* full_ref, char* out_sha) {
+    if (!git_dir || !full_ref || !out_sha) return false;
+    out_sha[0] = '\0';
+
+    wchar_t packed_refs_path[Git::MAX_PATH_LEN];
+    make_path(packed_refs_path, Git::MAX_PATH_LEN, git_dir, L"packed-refs");
+
+    MemoryMap* map = mmap_open(packed_refs_path);
+    if (!map || !map->data || map->size == 0) {
+        mmap_close(map);
+        return false;
+    }
+
+    const char* data = static_cast<const char*>(map->data);
+    size_t size = map->size;
+    size_t full_ref_len = strlen(full_ref);
+    bool found = false;
+
+    size_t i = 0;
+    while (i < size) {
+        size_t line_start = i;
+        while (i < size && data[i] != '\n' && data[i] != '\r') i++;
+        size_t line_len = i - line_start;
+        while (i < size && (data[i] == '\n' || data[i] == '\r')) i++;
+
+        if (line_len == 0) continue;
+        if (data[line_start] == '#' || data[line_start] == '^') continue;
+        if (line_len > 41 && data[line_start + 40] == ' ') {
+            size_t ref_len = line_len - 41;
+            if (ref_len == full_ref_len &&
+                memcmp(data + line_start + 41, full_ref, full_ref_len) == 0) {
+                memcpy(out_sha, data + line_start, Git::SHA1_HEX_SIZE);
+                out_sha[Git::SHA1_HEX_SIZE] = '\0';
+                found = true;
+                break;
+            }
+        }
+    }
+
+    mmap_close(map);
+    return found;
+}
+
+// Resolve refs/<...> under .git to a 40-char SHA. Loose ref files take
+// precedence over packed-refs. Follows symbolic refs with a depth limit.
+static bool resolve_ref_sha(const wchar_t* git_dir, const char* ref_path_utf8,
+                            char* out_sha, int symref_depth = 0) {
+    if (!git_dir || !ref_path_utf8 || !out_sha) return false;
+    out_sha[0] = '\0';
+    if (symref_depth > 5) return false;
+
+    wchar_t ref_path_wide[Git::MAX_PATH_LEN];
+    utf8_to_wide_n(ref_path_utf8, ref_path_wide, Git::MAX_PATH_LEN);
+    for (wchar_t* p = ref_path_wide; *p; p++) {
+        if (*p == L'/') *p = L'\\';
+    }
+
+    wchar_t full_path[Git::MAX_PATH_LEN];
+    make_path(full_path, Git::MAX_PATH_LEN, git_dir, ref_path_wide);
+
+    char content[256];
+    size_t n = read_file(full_path, content, sizeof(content));
+    if (n > 0) {
+        strip_trailing(content);
+        if (strncmp(content, "ref: ", 5) == 0) {
+            return resolve_ref_sha(git_dir, content + 5, out_sha, symref_depth + 1);
+        }
+        if (strlen(content) >= Git::SHA1_HEX_SIZE) {
+            strncpy_s(out_sha, Git::SHA1_HEX_SIZE + 1, content, Git::SHA1_HEX_SIZE);
+            out_sha[Git::SHA1_HEX_SIZE] = '\0';
+            return true;
+        }
+    }
+
+    return packed_refs_lookup_sha(git_dir, ref_path_utf8, out_sha);
+}
+
 // Git tree/index paths are repository-relative POSIX paths. Reject paths that
 // cannot be safely mapped to a Windows worktree path.
 static bool git_is_safe_relative_path(const char* path) {
@@ -220,10 +300,11 @@ static size_t read_loose_object(GitRepository* repo, const char* sha,
         buf_size = 64 * 1024;
     }
 
-    // Cap at 4GB to prevent runaway allocations while still supporting large blobs
-    const size_t MAX_OBJECT_SIZE = 4ULL * 1024 * 1024 * 1024;
+    // Cap at 2 GiB: zlib avail_out/total_out are uInt/uLong (32-bit on Windows),
+    // so a 4 GiB cap would cast to 0 and always fail inflate. Matches pack MAX_OBJ_SIZE.
+    const size_t MAX_OBJECT_SIZE = 2ULL * 1024 * 1024 * 1024;
     if (buf_size > MAX_OBJECT_SIZE) {
-        LOG_DEBUG(PackParse, "loose object read: buf_size capped to 4GB (was %zu)", buf_size);
+        LOG_DEBUG(PackParse, "loose object read: buf_size capped to 2GB (was %zu)", buf_size);
         buf_size = MAX_OBJECT_SIZE;
     }
 
@@ -246,7 +327,7 @@ static size_t read_loose_object(GitRepository* repo, const char* sha,
             size_t multiplier = retry_multipliers[i];
             buf_size = mmap->size * multiplier;
             if (buf_size > MAX_OBJECT_SIZE) {
-                LOG_DEBUG(PackParse, "loose object retry: buf_size capped to 4GB (was %zu)", buf_size);
+                LOG_DEBUG(PackParse, "loose object retry: buf_size capped to 2GB (was %zu)", buf_size);
                 buf_size = MAX_OBJECT_SIZE;
             }
             
@@ -282,26 +363,52 @@ static size_t read_loose_object(GitRepository* repo, const char* sha,
         return 0;
     }
 
-    // Parse type
-    if (out_type) {
-        if (strncmp(buffer, "commit ", 7) == 0) {
-            *out_type = GitObjectType::Commit;
-        } else if (strncmp(buffer, "tree ", 5) == 0) {
-            *out_type = GitObjectType::Tree;
-        } else if (strncmp(buffer, "blob ", 5) == 0) {
-            *out_type = GitObjectType::Blob;
-        } else if (strncmp(buffer, "tag ", 4) == 0) {
-            *out_type = GitObjectType::Tag;
-        } else {
-            *out_type = GitObjectType::Invalid;
-        }
+    // Parse type (space after type name is required)
+    GitObjectType parsed_type = GitObjectType::Invalid;
+    const char* size_start = nullptr;
+    if (strncmp(buffer, "commit ", 7) == 0) {
+        parsed_type = GitObjectType::Commit;
+        size_start = buffer + 7;
+    } else if (strncmp(buffer, "tree ", 5) == 0) {
+        parsed_type = GitObjectType::Tree;
+        size_start = buffer + 5;
+    } else if (strncmp(buffer, "blob ", 5) == 0) {
+        parsed_type = GitObjectType::Blob;
+        size_start = buffer + 5;
+    } else if (strncmp(buffer, "tag ", 4) == 0) {
+        parsed_type = GitObjectType::Tag;
+        size_start = buffer + 4;
+    } else {
+        delete[] buffer;
+        return 0;
+    }
+    if (out_type) *out_type = parsed_type;
+
+    // Declared size must be decimal digits up to the header NUL and match content length
+    if (size_start >= null_pos) {
+        delete[] buffer;
+        return 0;
+    }
+    char* size_end = nullptr;
+    unsigned long long declared_size = strtoull(size_start, &size_end, 10);
+    if (size_end == size_start || size_end != null_pos) {
+        delete[] buffer;
+        return 0;
     }
 
     // Return content (after the null byte)
-    size_t header_len = null_pos - buffer + 1;
+    size_t header_len = static_cast<size_t>(null_pos - buffer) + 1;
     size_t content_len = decompressed - header_len;
+    if (declared_size != content_len) {
+        delete[] buffer;
+        return 0;
+    }
 
-    char* content = new char[content_len + 1];
+    char* content = new (std::nothrow) char[content_len + 1];
+    if (!content) {
+        delete[] buffer;
+        return 0;
+    }
     memcpy(content, null_pos + 1, content_len);
     content[content_len] = '\0';
 
@@ -1332,7 +1439,8 @@ static char* apply_delta(const char* base, size_t base_size,
         return nullptr;
     }
 
-    char* result = new char[tgt_size + 1];
+    char* result = new (std::nothrow) char[static_cast<size_t>(tgt_size) + 1];
+    if (!result) return nullptr;
     size_t result_pos = 0;
 
     // Process delta instructions
@@ -1394,8 +1502,15 @@ static char* apply_delta(const char* base, size_t base_size,
         }
     }
 
+    // Must produce exactly the declared target size. Early exit left uninitialized
+    // bytes in the buffer and reported success with a wrong object payload.
+    if (result_pos != tgt_size) {
+        delete[] result;
+        return nullptr;
+    }
+
     result[tgt_size] = '\0';
-    *result_size = tgt_size;
+    *result_size = static_cast<size_t>(tgt_size);
     return result;
 }
 
@@ -1457,8 +1572,9 @@ static char* resolve_pack_object(GitRepository* repo, GitPackFile* pack,
         }
 
         // Read and decompress delta data
-        char* delta_data = new char[size + 1];
-        size_t delta_decompressed = zlib_decompress(ptr, end - ptr, delta_data, size);
+        char* delta_data = new (std::nothrow) char[static_cast<size_t>(size) + 1];
+        if (!delta_data) return nullptr;
+        size_t delta_decompressed = zlib_decompress(ptr, end - ptr, delta_data, static_cast<size_t>(size));
         if (delta_decompressed != size) {
             LOG("resolve_pack_object: OFS_DELTA decompress failed at offset %llu - expected %llu got %zu depth %d",
                 offset, size, delta_decompressed, depth);
@@ -1506,8 +1622,9 @@ static char* resolve_pack_object(GitRepository* repo, GitPackFile* pack,
         ptr += 20;
 
         // Read and decompress delta data
-        char* delta_data = new char[size + 1];
-        size_t delta_decompressed = zlib_decompress(ptr, end - ptr, delta_data, size);
+        char* delta_data = new (std::nothrow) char[static_cast<size_t>(size) + 1];
+        if (!delta_data) return nullptr;
+        size_t delta_decompressed = zlib_decompress(ptr, end - ptr, delta_data, static_cast<size_t>(size));
         if (delta_decompressed != size) {
             LOG("resolve_pack_object: REF_DELTA decompress failed at offset %llu - expected %llu got %zu depth %d",
                 offset, size, delta_decompressed, depth);
@@ -1573,8 +1690,9 @@ static char* resolve_pack_object(GitRepository* repo, GitPackFile* pack,
             LOG("resolve_pack_object: regular object ptr past end at offset %llu depth %d", offset, depth);
             return nullptr;
         }
-        char* output = new char[size + 1];
-        size_t decompressed = zlib_decompress(ptr, end - ptr, output, size);
+        char* output = new (std::nothrow) char[static_cast<size_t>(size) + 1];
+        if (!output) return nullptr;
+        size_t decompressed = zlib_decompress(ptr, end - ptr, output, static_cast<size_t>(size));
 
         if (decompressed != size) {
             LOG("resolve_pack_object: regular object decompress failed at offset %llu type %d - expected %llu got %zu depth %d",
@@ -1585,7 +1703,7 @@ static char* resolve_pack_object(GitRepository* repo, GitPackFile* pack,
 
         output[size] = '\0';
         *out_type = type;
-        *out_size = size;
+        *out_size = static_cast<size_t>(size);
         return output;
     }
 }
@@ -1887,8 +2005,9 @@ static bool git_read_tree_flat_recursive(TreeFlattenContext* ctx, const char* tr
                 ctx->capacity = new_capacity;
             }
 
-            // Add entry
+            // Add entry (stage 0 — tree blobs are never unmerged)
             ctx->entries[ctx->count].mode = te->mode;
+            ctx->entries[ctx->count].stage = 0;
             strcpy_s(ctx->entries[ctx->count].sha, te->sha);
             strcpy_s(ctx->entries[ctx->count].path, full_path);
             ctx->count++;
@@ -1960,6 +2079,7 @@ static size_t git_read_tree_flat_impl(GitRepository* repo, const char* tree_sha,
             count += sub_count;
         } else {
             entries[count].mode = te->mode;
+            entries[count].stage = 0;
             strcpy_s(entries[count].sha, te->sha);
             strcpy_s(entries[count].path, full_path);
             count++;

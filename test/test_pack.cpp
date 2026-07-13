@@ -322,6 +322,63 @@ TEST(pack_delta_large_insert) {
     free(result);
 }
 
+TEST(pack_delta_incomplete_target_rejected) {
+    // Declared target size is 10 but only 3 bytes of payload are produced.
+    // Must fail rather than return an under-filled (uninitialized) buffer.
+    const char base[] = "abcdefghij";
+    uint8_t delta[] = {
+        0x0A,           // Base size = 10
+        0x0A,           // Target size = 10
+        0x03, 'x', 'y', 'z'  // Insert only 3 bytes
+    };
+
+    size_t result_size = 999;
+    char* result = test_apply_delta(base, 10, delta, sizeof(delta), &result_size);
+
+    TEST_ASSERT_NULL(result);
+    // result_size should be left unchanged or only set on success; either way no buffer
+    (void)result_size;
+}
+
+TEST(pack_delta_base_size_mismatch_rejected) {
+    const char base[] = "short";
+    uint8_t delta[] = {
+        0x0A,  // Claims base size 10
+        0x05,  // Target size 5
+        0x90, 0x05  // Copy 5 from offset 0
+    };
+
+    size_t result_size = 0;
+    char* result = test_apply_delta(base, 5, delta, sizeof(delta), &result_size);
+    TEST_ASSERT_NULL(result);
+}
+
+TEST(pack_delta_cmd_zero_rejected) {
+    const char base[] = "abc";
+    uint8_t delta[] = {
+        0x03,  // Base size 3
+        0x03,  // Target size 3
+        0x00   // Reserved cmd == 0
+    };
+
+    size_t result_size = 0;
+    char* result = test_apply_delta(base, 3, delta, sizeof(delta), &result_size);
+    TEST_ASSERT_NULL(result);
+}
+
+TEST(pack_delta_copy_oob_rejected) {
+    const char base[] = "abc";  // size 3
+    uint8_t delta[] = {
+        0x03,        // Base size 3
+        0x05,        // Target size 5
+        0x91, 0x02, 0x05  // Copy size=5 from offset=2 → past end of base
+    };
+
+    size_t result_size = 0;
+    char* result = test_apply_delta(base, 3, delta, sizeof(delta), &result_size);
+    TEST_ASSERT_NULL(result);
+}
+
 // ============================================================================
 // Section 7: Integration Tests (require fixture files)
 // ============================================================================
