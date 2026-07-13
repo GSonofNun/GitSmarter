@@ -283,7 +283,8 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
                 g_worker.clone_progress.base.start_time_ms.store(clone_start);
                 g_worker.clone_progress.base.generation.fetch_add(1);
                 
-                LOG("worker_telemetry: job=clone status=start url=%s destination=...", g_worker.clone_url);
+                // Do not log full clone URL — may embed user:pass credentials.
+                LOG("worker_telemetry: job=clone status=start destination=...");
 
                 // Build clone options
                 CloneOptions options = {};

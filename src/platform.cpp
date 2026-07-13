@@ -7523,8 +7523,8 @@ static LRESULT handle_wm_auth_complete(HWND hwnd, WPARAM wParam, LPARAM lParam) 
                 g_pending_operation.remote_name);
             retry_started = worker_start_async_pull(g_pending_operation.remote_name);
         } else if (g_pending_operation.type == PendingOpType::Clone) {
-            LOG("WM_AUTH_COMPLETE - Retrying clone operation (url: %s)",
-                g_pending_operation.clone_url);
+            // Do not log full clone URL — may embed user:pass credentials.
+            LOG("WM_AUTH_COMPLETE - Retrying clone operation");
             retry_started = worker_start_async_clone(g_pending_operation.clone_url,
                                                      g_pending_operation.clone_destination);
         }

@@ -1514,7 +1514,8 @@ bool oauth_request_device_code(OAuthDeviceFlow* flow) {
     }
     response[totalRead] = '\0';
 
-    LOG("oauth_request_device_code() - Response body: %s", response);
+    // Never log the raw body: it contains device_code (and related secrets).
+    LOG("oauth_request_device_code() - Response received (%lu bytes)", totalRead);
 
     // Cleanup handles
     WinHttpCloseHandle(hRequest);
@@ -1633,7 +1634,8 @@ int oauth_poll_for_token(const OAuthDeviceFlow* flow, OAuthResult* result) {
     }
     response[totalRead] = '\0';
 
-    LOG("oauth_poll_for_token() - Response: %s", response);
+    // Never log the raw body: success responses contain access_token / refresh_token.
+    LOG("oauth_poll_for_token() - Response received (%lu bytes)", totalRead);
 
     // Cleanup handles
     WinHttpCloseHandle(hRequest);
@@ -1705,9 +1707,7 @@ bool git_credential_fill(const char* url, GitCredential* cred) {
 
     memset(cred, 0, sizeof(GitCredential));
 
-    LOG("git_credential_fill() - URL: %s", url);
-
-    // Parse URL to extract host
+    // Parse URL to extract host (do not log the raw URL — may embed user:pass)
     char host[256], path[1024];
     int port;
     bool is_https;
@@ -1717,7 +1717,7 @@ bool git_credential_fill(const char* url, GitCredential* cred) {
         return false;
     }
 
-    LOG("git_credential_fill() - Parsed host: %s, https: %d", host, is_https);
+    LOG("git_credential_fill() - host: %s, https: %d", host, is_https);
 
     strncpy_s(cred->protocol, is_https ? "https" : "http", sizeof(cred->protocol) - 1);
     strncpy_s(cred->host, host, sizeof(cred->host) - 1);
