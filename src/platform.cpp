@@ -96,6 +96,15 @@ static inline void set_cursor_cached(HCURSOR c) {
         SetCursor(c);
     }
 }
+
+static LRESULT handle_wm_setcursor(HWND hwnd, WPARAM wParam, LPARAM lParam) {
+    (void)hwnd;
+    if (reinterpret_cast<HWND>(wParam) == g_main_window && LOWORD(lParam) == HTCLIENT && g_cursor_last_set) {
+        SetCursor(g_cursor_last_set);
+        return TRUE;
+    }
+    return -1;
+}
 ID2D1Factory* g_d2d_factory = nullptr;
 ID2D1HwndRenderTarget* g_render_target = nullptr;
 ID2D1DeviceContext* g_d2d_device_context = nullptr;  // For effects (queried from render target)
@@ -8989,6 +8998,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_MOUSEMOVE: 
         return handle_wm_mousemove(hwnd, wParam, lParam);
+
+    case WM_SETCURSOR: {
+        LRESULT result = handle_wm_setcursor(hwnd, wParam, lParam);
+        if (result >= 0) {
+            return result;
+        }
+        break;
+    }
 
     case WM_MOUSELEAVE:
         return handle_wm_mouseleave(hwnd, wParam, lParam);
