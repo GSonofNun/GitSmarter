@@ -554,6 +554,48 @@ TEST(text_document_undo_redo) {
     delete doc;
 }
 
+// Regression FIND-059: undo/redo must not treat cursor position 0 as failure.
+// push_undo() defaults cursor_pos to 0, so a successful undo returns 0.
+TEST(text_document_undo_restores_dirty_when_cursor_zero) {
+    TextDocument* doc = TextDocument::from_string("hello");
+    TEST_ASSERT_FALSE(doc->is_dirty());
+
+    doc->push_undo();  // snapshot stores cursor_pos = 0 by default
+    doc->insert(5, " world", 6);
+    TEST_ASSERT_TRUE(doc->is_dirty());
+
+    TEST_ASSERT_TRUE(doc->undo());
+    TEST_ASSERT_EQ(doc->length(), 5u);
+    // Back to clean undo position (0) — dirty must clear
+    TEST_ASSERT_FALSE(doc->is_dirty());
+
+    TEST_ASSERT_TRUE(doc->redo());
+    TEST_ASSERT_EQ(doc->length(), 11u);
+    TEST_ASSERT_TRUE(doc->is_dirty());
+
+    // Nothing left to redo
+    TEST_ASSERT_FALSE(doc->redo());
+
+    delete doc;
+}
+
+TEST(piece_table_insert_null_text_fails) {
+    PieceTable pt;
+    pt.init_from_string("abc", 3);
+
+    // Null buffer with positive length must not report success
+    TEST_ASSERT_FALSE(pt.insert(1, nullptr, 5));
+    TEST_ASSERT_EQ(pt.total_length(), 3u);
+
+    // Empty insert at valid position is success no-op
+    TEST_ASSERT_TRUE(pt.insert(1, nullptr, 0));
+    TEST_ASSERT_TRUE(pt.insert(1, "x", 0));
+    TEST_ASSERT_EQ(pt.total_length(), 3u);
+
+    // Out of bounds fails
+    TEST_ASSERT_FALSE(pt.insert(99, "z", 1));
+}
+
 TEST(text_document_line_count) {
     TextDocument* doc = TextDocument::from_string("line1\nline2\nline3");
     TEST_ASSERT_EQ(doc->line_count(), 3u);
