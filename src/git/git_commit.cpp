@@ -4,10 +4,10 @@
 // 1. Tree Building (Step 5) (line 20)
 // 2. Git Config Parsing (Step 6) (line 233)
 // 3. Commit Creation (Step 7) (line 416)
-// 4. Tag Operations (line 612)
-// 5. Cherry-Pick and Revert Operations (line 771)
-// 6. Reflog Support (line 1216)
-// 7. Stash Operations (line 1574)
+// 4. Tag Operations (line 618)
+// 5. Cherry-Pick and Revert Operations (line 777)
+// 6. Reflog Support (line 1222)
+// 7. Stash Operations (line 1580)
 //
 // </AUTO-GENERATED TOC>
 // git_commit.cpp - Commit operations, reflog, and stash
@@ -418,11 +418,14 @@ bool git_config_load(GitRepository* repo, GitConfig* config) {
 // ============================================================================
 
 // Forward declaration: defined below.
+// author_time: Unix timestamp for the author line, or < 0 to use current time.
+// Committer timestamp is always "now" (matches git commit / commit --amend).
 bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
                              const char** parent_shas, size_t parent_count,
                              const char* author_name, const char* author_email,
                              const char* committer_name, const char* committer_email,
-                             const char* message, char* out_commit_sha);
+                             const char* message, char* out_commit_sha,
+                             int64_t author_time = -1);
 
 // Create a commit object
 // parent_sha can be nullptr or empty for initial commit
@@ -436,17 +439,19 @@ bool git_commit_create(GitRepository* repo, const char* tree_sha, const char* pa
     return git_commit_create_multi(repo, tree_sha, parents, parent_count,
                                    author_name, author_email,
                                    committer_name, committer_email,
-                                   message, out_commit_sha);
+                                   message, out_commit_sha, -1);
 }
 
 // Create a commit with multiple parents (for stash W commits, merges, etc.)
 // parent_shas is array of parent SHA strings, parent_count is number of parents (0-8)
+// author_time < 0 means use current time for author; committer always uses now
 // Returns: true on success, fills out_commit_sha with commit SHA
 bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
                              const char** parent_shas, size_t parent_count,
                              const char* author_name, const char* author_email,
                              const char* committer_name, const char* committer_email,
-                             const char* message, char* out_commit_sha) {
+                             const char* message, char* out_commit_sha,
+                             int64_t author_time) {
     if (!repo || !repo->is_valid || !tree_sha || !message || !out_commit_sha) return false;
     if (!author_name || !author_email || !committer_name || !committer_email) return false;
     if (parent_count > 0 && !parent_shas) return false;
@@ -455,8 +460,9 @@ bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
         return false;
     }
 
-    // Get current Unix timestamp
+    // Get current Unix timestamp (committer always "now"; author may preserve amend time)
     int64_t now = static_cast<int64_t>(time(nullptr));
+    int64_t author_ts = (author_time >= 0) ? author_time : now;
 
     // Get timezone offset
     TIME_ZONE_INFORMATION tz_info;
@@ -496,7 +502,7 @@ bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
 
     // author <name> <email> <timestamp> <timezone>
     APPEND_FMT("author %s <%s> %lld %s\n",
-               author_name, author_email, (long long)now, tz_str);
+               author_name, author_email, (long long)author_ts, tz_str);
 
     // committer <name> <email> <timestamp> <timezone>
     APPEND_FMT("committer %s <%s> %lld %s\n",
@@ -2217,9 +2223,21 @@ bool git_stash_create(GitRepository* repo, const StashCreateOptions* options, St
                         }
                     }
                 } else {
-                    // Not in HEAD: was untracked or staged-add — remove from worktree + index
-                    DeleteFileW(file_path);
-                    git_index_remove_path(&index, path);
+                    // Not in HEAD: staged new file and/or untracked. Only remove from the
+                    // worktree if the path was actually part of the stash:
+                    //  - staged-add (present in index) is always in the I/W commits
+                    //  - pure untracked is only stashed when include_untracked is set
+                    bool in_index = false;
+                    for (size_t i = 0; i < index.entry_count; i++) {
+                        if (strcmp(index.entries[i].path, path) == 0) {
+                            in_index = true;
+                            break;
+                        }
+                    }
+                    if (in_index || include_untracked) {
+                        DeleteFileW(file_path);
+                        git_index_remove_path(&index, path);
+                    }
                 }
             }
             if (!git_index_write(repo, &index)) {
@@ -2817,13 +2835,14 @@ bool git_commit(GitRepository* repo, const char* message, bool amend) {
 
     // Create commit object
     char commit_sha[Git::SHA1_HEX_SIZE + 1];
-    if (is_merge_amend) {
+    if (amend) {
+        // Preserve original author timestamp (git commit --amend); committer is "now"
         const char* parents[2] = { parent_sha, parent2_sha };
-        size_t parent_count = 2;
+        size_t parent_count = is_merge_amend ? 2u : (parent_sha[0] != '\0' ? 1u : 0u);
         if (!git_commit_create_multi(repo, tree_sha, parents, parent_count,
                                      author_name, author_email,
                                      config.user_name, config.user_email,
-                                     message, commit_sha)) {
+                                     message, commit_sha, head_commit.author_time)) {
             return false;
         }
     } else if (!git_commit_create(repo, tree_sha, parent_sha,

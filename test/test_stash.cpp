@@ -760,3 +760,41 @@ TEST(stash_create_selected_preserves_unselected) {
     git_repo_close(&repo);
     cleanup_write_test_repo();
 }
+
+// Partial pathspec with include_untracked=false must not delete a selected untracked
+// file that was never stored in the stash (only tracked changes were stashed).
+TEST(stash_create_selected_keeps_untracked_when_not_included) {
+    if (!create_write_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_write_test_repo)) {
+        cleanup_write_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    // Tracked change (selected) + untracked file (also in selection list)
+    write_test_file(g_write_test_repo, "file1.txt", "tracked-stashed\n");
+    write_test_file(g_write_test_repo, "brand_new_untracked.txt", "must-survive-untracked\n");
+
+    const char* selected[] = { "file1.txt", "brand_new_untracked.txt" };
+    StashCreateOptions options = {};
+    options.selected_paths = selected;
+    options.selected_path_count = 2;
+    options.include_untracked = false;  // untracked is listed but not stashed
+
+    StashResult result = {};
+    TEST_ASSERT_TRUE(git_stash_create(&repo, &options, &result));
+    TEST_ASSERT_TRUE(result.success);
+
+    // Untracked file must still exist on disk
+    size_t size = 0;
+    char* content = read_test_file(g_write_test_repo, "brand_new_untracked.txt", &size);
+    TEST_ASSERT_TRUE(content != nullptr);
+    TEST_ASSERT_TRUE(strstr(content, "must-survive-untracked") != nullptr);
+    delete[] content;
+
+    git_repo_close(&repo);
+    cleanup_write_test_repo();
+}

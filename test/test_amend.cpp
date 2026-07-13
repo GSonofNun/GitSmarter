@@ -372,6 +372,14 @@ TEST(amend_preserves_author) {
     TEST_ASSERT_TRUE(git_ref_update(&repo, ref_path, alice_sha));
     strcpy_s(repo.head_sha, alice_sha);
 
+    GitCommit before_amend = {};
+    TEST_ASSERT_TRUE(git_read_commit(&repo, repo.head_sha, &before_amend));
+    int64_t original_author_time = before_amend.author_time;
+    TEST_ASSERT_TRUE(original_author_time != 0);
+
+    // Ensure wall clock advances so a bug that stamps "now" would differ
+    Sleep(1100);
+
     TEST_ASSERT_TRUE(git_commit(&repo, "Amended message keeping author", true));
 
     GitCommit after = {};
@@ -379,6 +387,8 @@ TEST(amend_preserves_author) {
     TEST_ASSERT_STREQ(after.author_name, "Alice Amend");
     TEST_ASSERT_STREQ(after.author_email, "alice@amend.test");
     TEST_ASSERT_TRUE(strstr(after.message, "Amended message keeping author") != nullptr);
+    // Author date must be preserved; committer is refreshed (may equal author if fast)
+    TEST_ASSERT_EQ(after.author_time, original_author_time);
 
     git_repo_close(&repo);
     cleanup_write_test_repo();
