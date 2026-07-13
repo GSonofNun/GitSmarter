@@ -7008,14 +7008,8 @@ static LRESULT handle_wm_fetch_complete(HWND hwnd, WPARAM wParam, LPARAM lParam)
     bool success = (wParam != 0);
 
     if (success) {
-        // Show message only for manual fetches
-        if (!silent) {
-            wchar_t msg[512];
-            swprintf_s(msg, L"Fetch successful!\n\nRefs updated: %zu\nObjects received: %zu\nBytes received: %llu\nDuration: %lld ms",
-                       result.refs_updated, result.objects_received,
-                       result.bytes_received, result.duration_ms);
-            MessageBoxW(hwnd, msg, L"Fetch Complete", MB_OK | MB_ICONINFORMATION);
-        }
+        // Success is silent — status bar / ahead-behind refresh is the feedback.
+        // (A MessageBox here was debug-only and stacked on every background fetch.)
 
         // Refresh status and HEAD
         {
