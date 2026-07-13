@@ -3,8 +3,8 @@
 //
 // 1. Parallel Checkout Infrastructure (line 13)
 // 2. PULL OPERATIONS (fast-forward only) (line 628)
-// 3. Branch Checkout (line 1570)
-// 4. Reset Operations (line 1803)
+// 3. Branch Checkout (line 1577)
+// 4. Reset Operations (line 1810)
 //
 // </AUTO-GENERATED TOC>
 #include "app.h"
@@ -1267,10 +1267,15 @@ static bool update_index_from_tree(GitRepository* repo, const char* tree_sha) {
     index.entry_count = 0;
 
     for (size_t i = 0; i < count; i++) {
-        // Do not index unsafe paths (same policy as checkout)
+        // Match checkout policy: refuse the whole rebuild if any path is unsafe.
+        // Skipping would write a partial index (HEAD/index mismatch on mixed reset).
         if (!git_is_safe_relative_path(tree[i].path)) {
-            LOG("update_index_from_tree: skipping unsafe path %s", tree[i].path);
-            continue;
+            LOG("update_index_from_tree: unsafe path in tree: %s — failing index rebuild",
+                tree[i].path);
+            delete[] tree;
+            git_index_close_full(&index);
+            git_index_unlock(repo);
+            return false;
         }
 
         // Submodules (gitlink): synthetic zeros — no worktree file to stat
@@ -1280,6 +1285,7 @@ static bool update_index_from_tree(GitRepository* repo, const char* tree_sha) {
             strcpy_s(entry->path, tree[i].path);
             strcpy_s(entry->sha, tree[i].sha);
             entry->mode = tree[i].mode;
+            entry->stage = 0;
             index.entry_count++;
             continue;
         }
@@ -1289,6 +1295,7 @@ static bool update_index_from_tree(GitRepository* repo, const char* tree_sha) {
         strcpy_s(entry->path, tree[i].path);
         strcpy_s(entry->sha, tree[i].sha);
         entry->mode = tree[i].mode;
+        entry->stage = 0;
 
         // Get stat info from the file we just wrote
         stat_file_for_index(repo, tree[i].path, entry);

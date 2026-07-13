@@ -389,3 +389,66 @@ TEST(checkout_empty_tree_succeeds) {
     git_repo_close(&repo);
     cleanup_reset_test_repo();
 }
+
+// Mixed reset must fail (and roll HEAD back) if the target tree has unsafe paths.
+// Skipping those paths would leave an index that cannot represent HEAD.
+TEST(reset_mixed_fails_on_unsafe_tree_path) {
+    if (!create_reset_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_reset_test_repo)) {
+        cleanup_reset_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    char original_head[Git::SHA1_HEX_SIZE + 1];
+    strcpy_s(original_head, repo.head_sha);
+
+    GitConfig config = {};
+    TEST_ASSERT_TRUE(git_config_load(&repo, &config));
+
+    // Blob used by both safe and hostile tree entries
+    const char* blob_content = "hostile-tree-blob\n";
+    char blob_sha[41] = {};
+    TEST_ASSERT_TRUE(git_write_object(&repo, GitObjectType::Blob,
+                                      blob_content, strlen(blob_content), blob_sha));
+    uint8_t blob_raw[20];
+    hex_to_sha(blob_sha, blob_raw);
+
+    // Tree: safe file + ".git/config" (rejected by path safety)
+    uint8_t tree_buf[256];
+    uint8_t* p = tree_buf;
+    auto append_entry = [&](const char* mode_name) {
+        size_t n = strlen(mode_name);
+        memcpy(p, mode_name, n + 1);
+        p += n + 1;
+        memcpy(p, blob_raw, 20);
+        p += 20;
+    };
+    append_entry("100644 ok.txt");
+    append_entry("100644 .git/config");
+    size_t tree_size = static_cast<size_t>(p - tree_buf);
+
+    char tree_sha[41] = {};
+    TEST_ASSERT_TRUE(git_write_object(&repo, GitObjectType::Tree,
+                                      tree_buf, tree_size, tree_sha));
+
+    char commit_sha[41] = {};
+    TEST_ASSERT_TRUE(git_commit_create(&repo, tree_sha, repo.head_sha,
+                                       config.user_name, config.user_email,
+                                       config.user_name, config.user_email,
+                                       "commit with unsafe path\n", commit_sha));
+    // Leave as dangling commit (do not update HEAD) — reset will target it
+    char error[256] = {};
+    TEST_ASSERT_FALSE(git_reset(&repo, commit_sha, ResetMode::Mixed, error, sizeof(error)));
+    TEST_ASSERT_TRUE(error[0] != '\0');
+
+    // HEAD must be unchanged after failed mixed reset
+    TEST_ASSERT_TRUE(git_read_head(&repo));
+    TEST_ASSERT_STREQ(repo.head_sha, original_head);
+
+    git_repo_close(&repo);
+    cleanup_reset_test_repo();
+}
