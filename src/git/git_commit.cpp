@@ -4,10 +4,10 @@
 // 1. Tree Building (Step 5) (line 20)
 // 2. Git Config Parsing (Step 6) (line 233)
 // 3. Commit Creation (Step 7) (line 416)
-// 4. Tag Operations (line 610)
-// 5. Cherry-Pick and Revert Operations (line 769)
-// 6. Reflog Support (line 1214)
-// 7. Stash Operations (line 1572)
+// 4. Tag Operations (line 612)
+// 5. Cherry-Pick and Revert Operations (line 771)
+// 6. Reflog Support (line 1216)
+// 7. Stash Operations (line 1574)
 //
 // </AUTO-GENERATED TOC>
 // git_commit.cpp - Commit operations, reflog, and stash
@@ -537,6 +537,8 @@ bool git_ref_update(GitRepository* repo, const char* ref_name, const char* sha) 
         if (strncmp(ref_name, "refs/", 5) != 0) return false;
         if (strstr(ref_name, "..") != nullptr) return false;
         if (strchr(ref_name, '\\') != nullptr) return false;
+        // ':' creates NTFS alternate data streams (e.g. refs/heads/x:evil)
+        if (strchr(ref_name, ':') != nullptr) return false;
         // Reject absolute-ish segments and empty path components
         if (strstr(ref_name, "//") != nullptr) return false;
     } else {
