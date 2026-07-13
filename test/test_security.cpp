@@ -496,6 +496,121 @@ TEST(packed_refs_tag_and_branch_with_same_name_both_appear) {
     rmrf(work_dir);
 }
 
+// HEAD must resolve a branch tip that exists only in packed-refs (no loose ref file).
+// Put the tip *after* 40KB of padding so the old 32KB stack scan would miss it.
+TEST(head_resolves_from_packed_refs_only) {
+    constexpr size_t PAD_LINES = 600;  // ~600 * 70 ≈ 42KB of noise before tip
+    size_t buf_size = PAD_LINES * 80 + 256;
+    char* refs = new char[buf_size];
+    size_t pos = 0;
+    pos += snprintf(refs + pos, buf_size - pos,
+                    "# pack-refs with: peeled fully-peeled sorted \n");
+    for (size_t i = 0; i < PAD_LINES; i++) {
+        pos += snprintf(refs + pos, buf_size - pos,
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/tags/pad%06zu\n", i);
+    }
+    pos += snprintf(refs + pos, buf_size - pos,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n");
+    refs[pos] = '\0';
+
+    wchar_t work_dir[MAX_PATH];
+    bool created = make_temp_git_dir_with_packed_refs(refs, work_dir, MAX_PATH);
+    delete[] refs;
+    if (!created) {
+        TEST_SKIP("Could not create temp git dir");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, work_dir)) {
+        rmrf(work_dir);
+        TEST_SKIP("Could not open temp git dir as repo");
+    }
+
+    TEST_ASSERT_FALSE(repo.head_detached);
+    TEST_ASSERT_STREQ(repo.head_ref, "main");
+    TEST_ASSERT_STREQ(repo.head_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    TEST_ASSERT_TRUE(git_branch_exists(&repo, "main"));
+
+    git_repo_close(&repo);
+    rmrf(work_dir);
+}
+
+// Deleting a packed ref near the start of a >256KB packed-refs file must not
+// rewrite from a truncated buffer (would destroy every later ref).
+TEST(packed_refs_delete_preserves_tail_past_256kb) {
+    constexpr size_t TARGET_BYTES = 300 * 1024;  // > old 256KB remove-line cap
+    constexpr size_t LINE_LEN = 80;
+    size_t pad_count = TARGET_BYTES / LINE_LEN;
+
+    size_t buf_size = pad_count * LINE_LEN + 512;
+    char* content = new char[buf_size];
+    size_t pos = 0;
+    pos += snprintf(content + pos, buf_size - pos,
+                    "# pack-refs with: peeled fully-peeled sorted \n");
+    // Early branch we will delete (not current HEAD)
+    pos += snprintf(content + pos, buf_size - pos,
+                    "1111111111111111111111111111111111111111 refs/heads/todelete\n");
+    // HEAD tip (current branch — must remain)
+    pos += snprintf(content + pos, buf_size - pos,
+                    "2222222222222222222222222222222222222222 refs/heads/main\n");
+    // Bulk padding past 256KB
+    for (size_t i = 0; i < pad_count; i++) {
+        pos += snprintf(content + pos, buf_size - pos,
+                        "cccccccccccccccccccccccccccccccccccccccc refs/tags/bulk%06zu\n", i);
+    }
+    // Sentinel at end — unique SHA so we can detect tail survival
+    pos += snprintf(content + pos, buf_size - pos,
+                    "dddddddddddddddddddddddddddddddddddddddd refs/tags/sentinel-tail\n");
+    content[pos] = '\0';
+
+    wchar_t work_dir[MAX_PATH];
+    bool created = make_temp_git_dir_with_packed_refs(content, work_dir, MAX_PATH);
+    delete[] content;
+    if (!created) {
+        TEST_SKIP("Could not create temp git dir");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, work_dir)) {
+        rmrf(work_dir);
+        TEST_SKIP("Could not open temp git dir as repo");
+    }
+
+    // Ensure todelete is only packed (no loose) so delete rewrites packed-refs
+    TEST_ASSERT_TRUE(git_branch_exists(&repo, "todelete"));
+
+    char err[256] = {};
+    bool deleted = git_branch_delete(&repo, "todelete", true, err, sizeof(err));
+    TEST_ASSERT_TRUE(deleted);
+    TEST_ASSERT_FALSE(git_branch_exists(&repo, "todelete"));
+
+    // Tail sentinel must still be listed (would vanish under 256KB truncate rewrite)
+    GitRef* refs_out = new GitRef[pad_count + 32];
+    size_t count = git_list_refs(&repo, refs_out, pad_count + 32);
+    bool found_sentinel = false;
+    bool found_main = false;
+    for (size_t i = 0; i < count; i++) {
+        if (refs_out[i].type == GitRef::Type::Tag &&
+            strcmp(refs_out[i].name, "sentinel-tail") == 0 &&
+            strcmp(refs_out[i].sha, "dddddddddddddddddddddddddddddddddddddddd") == 0) {
+            found_sentinel = true;
+        }
+        if (refs_out[i].type == GitRef::Type::Local &&
+            strcmp(refs_out[i].name, "main") == 0) {
+            found_main = true;
+        }
+    }
+    delete[] refs_out;
+
+    TEST_ASSERT_TRUE(found_sentinel);
+    TEST_ASSERT_TRUE(found_main);
+    // Most pad tags should remain (allow some headroom vs capacity)
+    TEST_ASSERT_TRUE(count > pad_count / 2);
+
+    git_repo_close(&repo);
+    rmrf(work_dir);
+}
+
 TEST(packed_refs_large_file_not_truncated) {
     // Build a packed-refs file > 1 MB to confirm the size cap is gone.
     constexpr size_t TARGET_BYTES = 1500 * 1024;  // ~1.5 MB

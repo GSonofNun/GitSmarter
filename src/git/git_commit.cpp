@@ -203,7 +203,17 @@ bool git_write_tree_from_index(GitRepository* repo, char* out_tree_sha) {
         return false;  // Empty tree not allowed
     }
 
-    // Sort index by path (required for tree building)
+    // Git refuses write-tree when the index has unmerged (stage != 0) entries.
+    for (size_t i = 0; i < index.entry_count; i++) {
+        if (index.entries[i].stage != 0) {
+            LOG("git_write_tree_from_index: unmerged stages present (path=%s stage=%u)",
+                index.entries[i].path, index.entries[i].stage);
+            git_index_close_full(&index);
+            return false;
+        }
+    }
+
+    // Sort index by path then stage (required for tree building)
     if (index.entry_count > 1) {
         qsort(index.entries, index.entry_count, sizeof(GitIndexEntryFull), compare_paths_full);
     }
@@ -518,6 +528,26 @@ bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
 bool git_ref_update(GitRepository* repo, const char* ref_name, const char* sha) {
     if (!repo || !repo->is_valid || !ref_name || !sha) return false;
 
+    // Containment: only HEAD or refs/*; reject path escape and Windows separators
+    if (strcmp(ref_name, "HEAD") != 0) {
+        if (strncmp(ref_name, "refs/", 5) != 0) return false;
+        if (strstr(ref_name, "..") != nullptr) return false;
+        if (strchr(ref_name, '\\') != nullptr) return false;
+        // Reject absolute-ish segments and empty path components
+        if (strstr(ref_name, "//") != nullptr) return false;
+    } else {
+        // HEAD is a single file under .git — never treat as multi-segment path escape
+    }
+
+    // Require a full 40-char hex SHA (or all-zero for unborn/special cases callers may use)
+    size_t sha_len = strlen(sha);
+    if (sha_len != Git::SHA1_HEX_SIZE) return false;
+    for (size_t i = 0; i < sha_len; i++) {
+        char c = sha[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+
     wchar_t git_dir_wide[Git::MAX_PATH_LEN];
     utf8_to_wide_n(repo->git_dir, git_dir_wide, Git::MAX_PATH_LEN);
 
@@ -603,49 +633,11 @@ bool git_tag_exists(GitRepository* repo, const char* tag_name) {
         return true;
     }
 
-    // Check packed-refs
-    wchar_t packed_refs_path[Git::MAX_PATH_LEN];
-    make_path(packed_refs_path, Git::MAX_PATH_LEN, git_dir_wide, L"packed-refs");
-
-    constexpr size_t PACKED_REFS_BUFFER_SIZE = 1024 * 256; // 256KB
-    char* content = new char[PACKED_REFS_BUFFER_SIZE];
-    size_t bytes_read = read_file(packed_refs_path, content, PACKED_REFS_BUFFER_SIZE - 1);
-    if (bytes_read == 0) {
-        delete[] content;
-        return false;
-    }
-    content[bytes_read] = '\0';
-
-    // Build the full ref name to search for
+    // Check packed-refs via full mmap (no 256KB truncation)
     char full_ref[Git::MAX_REF_NAME + 16];
     snprintf(full_ref, sizeof(full_ref), "refs/tags/%s", tag_name);
-
-    // Search line by line
-    char* line_start = content;
-    while (*line_start) {
-        char* line_end = line_start;
-        while (*line_end && *line_end != '\n' && *line_end != '\r') line_end++;
-
-        char saved = *line_end;
-        *line_end = '\0';
-
-        // Skip comments and peeled refs
-        if (line_start[0] != '#' && line_start[0] != '^' && strlen(line_start) > 42) {
-            // Format: "<sha> <refname>"
-            char* ref_name_in_file = line_start + 41;
-            if (strcmp(ref_name_in_file, full_ref) == 0) {
-                delete[] content;
-                return true;
-            }
-        }
-
-        *line_end = saved;
-        line_start = line_end;
-        while (*line_start == '\n' || *line_start == '\r') line_start++;
-    }
-
-    delete[] content;
-    return false;
+    char sha[Git::SHA1_HEX_SIZE + 1];
+    return packed_refs_lookup_sha(git_dir_wide, full_ref, sha);
 }
 
 // Create a tag. If message is NULL, creates lightweight tag.

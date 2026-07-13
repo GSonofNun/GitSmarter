@@ -1209,6 +1209,31 @@ TEST(ref_update_null_inputs) {
     cleanup_write_test_repo();
 }
 
+TEST(ref_update_rejects_path_escape) {
+    if (!create_write_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_write_test_repo)) {
+        cleanup_write_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    // Must not write outside .git/refs
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/../../evil", repo.head_sha));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "not-a-ref", repo.head_sha));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs\\heads\\win", repo.head_sha));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/x", "not40chars"));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/x", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+
+    // Valid update still works
+    TEST_ASSERT_TRUE(git_ref_update(&repo, "refs/heads/safe-branch", repo.head_sha));
+
+    git_repo_close(&repo);
+    cleanup_write_test_repo();
+}
+
 TEST(branch_create_basic) {
     if (!create_write_test_repo()) {
         TEST_SKIP("Could not create temp test repo");

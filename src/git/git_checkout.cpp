@@ -559,27 +559,13 @@ bool git_sync_status(GitRepository* repo, const char* remote_name, BranchSyncSta
     snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s",
              remote_name, repo->head_ref);
 
-    // Read the remote tracking ref
+    // Loose ref first, then packed-refs (resolve_ref_sha in git_repo.cpp)
     wchar_t git_dir_wide[Git::MAX_PATH_LEN];
     utf8_to_wide_n(repo->git_dir, git_dir_wide, Git::MAX_PATH_LEN);
 
-    wchar_t ref_file[Git::MAX_PATH_LEN];
-    swprintf_s(ref_file, L"%s\\%hs", git_dir_wide, remote_ref_path);
-
-    // Convert slashes
-    for (wchar_t* p = ref_file; *p; p++) {
-        if (*p == L'/') *p = L'\\';
-    }
-
     char remote_sha[Git::SHA1_HEX_SIZE + 1] = {0};
-    char content[64];
-    size_t len = read_file(ref_file, content, sizeof(content));
-    if (len >= Git::SHA1_HEX_SIZE) {
-        memcpy(remote_sha, content, Git::SHA1_HEX_SIZE);
-        remote_sha[Git::SHA1_HEX_SIZE] = '\0';
-    } else {
-        // Remote tracking ref doesn't exist
-        return false;
+    if (!resolve_ref_sha(git_dir_wide, remote_ref_path, remote_sha)) {
+        return false;  // Remote tracking ref doesn't exist
     }
 
     const char* local_sha = repo->head_sha;
