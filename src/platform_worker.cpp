@@ -19,6 +19,10 @@ struct WorkerThreadState {
 
     // Current job
     enum class JobType { None, Fetch, Push, Pull, Checkout, Clone } job_type = JobType::None;
+    // Job finished on worker thread but UI has not yet handled the completion message.
+    // Keeps worker "busy" so a new job cannot overwrite results / kill progress timers
+    // before the matching WM_*_COMPLETE handler runs.
+    JobType pending_complete = JobType::None;
     char remote_name[64] = {0};
     bool silent = false;              // True for background sync (no message box)
 
@@ -65,6 +69,29 @@ static CRITICAL_SECTION g_worker_lock;  // Protects g_worker.job_type, remote_na
 
 // Forward declarations
 static DWORD WINAPI worker_thread_proc(LPVOID param);
+
+// Mark job done and notify UI. pending_complete keeps the worker busy until the
+// UI handler copies results and calls worker_ack_complete().
+static void worker_signal_complete(WorkerThreadState::JobType done_type, UINT msg, bool success) {
+    EnterCriticalSection(&g_worker_lock);
+    g_worker.job_type = WorkerThreadState::JobType::None;
+    g_worker.pending_complete = done_type;
+    LeaveCriticalSection(&g_worker_lock);
+
+    if (!PostMessageW(g_main_window, msg, success ? 1 : 0, 0)) {
+        // Message was not queued (e.g. window dying) — clear barrier so we don't stick busy.
+        EnterCriticalSection(&g_worker_lock);
+        g_worker.pending_complete = WorkerThreadState::JobType::None;
+        LeaveCriticalSection(&g_worker_lock);
+        LOG("[worker] PostMessage failed for complete msg %u err=%lu", msg, GetLastError());
+    }
+}
+
+// True if a job is running or UI still owes an ack for a completion message.
+static bool worker_is_occupied_unlocked() {
+    return g_worker.job_type != WorkerThreadState::JobType::None ||
+           g_worker.pending_complete != WorkerThreadState::JobType::None;
+}
 
 // Worker thread implementation
 static DWORD WINAPI worker_thread_proc(LPVOID param) {
@@ -128,10 +155,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
 
                 // Signal completion to main thread
                 constexpr UINT WM_FETCH_COMPLETE = WM_USER + 100;
-                EnterCriticalSection(&g_worker_lock);
-                g_worker.job_type = WorkerThreadState::JobType::None;
-                LeaveCriticalSection(&g_worker_lock);
-                PostMessageW(g_main_window, WM_FETCH_COMPLETE, success ? 1 : 0, 0);
+                worker_signal_complete(WorkerThreadState::JobType::Fetch, WM_FETCH_COMPLETE, success);
             }
             else if (job == WorkerThreadState::JobType::Push) {
                 // Reset push progress
@@ -168,10 +192,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
 
                 // Signal completion to main thread
                 constexpr UINT WM_PUSH_COMPLETE = WM_USER + 101;
-                EnterCriticalSection(&g_worker_lock);
-                g_worker.job_type = WorkerThreadState::JobType::None;
-                LeaveCriticalSection(&g_worker_lock);
-                PostMessageW(g_main_window, WM_PUSH_COMPLETE, success ? 1 : 0, 0);
+                worker_signal_complete(WorkerThreadState::JobType::Push, WM_PUSH_COMPLETE, success);
             }
             else if (job == WorkerThreadState::JobType::Pull) {
                 // Reset pull progress
@@ -206,10 +227,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
 
                 // Signal completion to main thread
                 constexpr UINT WM_PULL_COMPLETE = WM_USER + 102;
-                EnterCriticalSection(&g_worker_lock);
-                g_worker.job_type = WorkerThreadState::JobType::None;
-                LeaveCriticalSection(&g_worker_lock);
-                PostMessageW(g_main_window, WM_PULL_COMPLETE, success ? 1 : 0, 0);
+                worker_signal_complete(WorkerThreadState::JobType::Pull, WM_PULL_COMPLETE, success);
             }
             else if (job == WorkerThreadState::JobType::Checkout) {
                 // Reset checkout progress
@@ -249,10 +267,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
 
                 // Signal completion to main thread
                 constexpr UINT WM_CHECKOUT_COMPLETE = WM_USER + 104;
-                EnterCriticalSection(&g_worker_lock);
-                g_worker.job_type = WorkerThreadState::JobType::None;
-                LeaveCriticalSection(&g_worker_lock);
-                PostMessageW(g_main_window, WM_CHECKOUT_COMPLETE, success ? 1 : 0, 0);
+                worker_signal_complete(WorkerThreadState::JobType::Checkout, WM_CHECKOUT_COMPLETE, success);
             }
             else if (job == WorkerThreadState::JobType::Clone) {
                 // Reset clone progress
@@ -300,10 +315,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
 
                 // Signal completion to main thread
                 constexpr UINT WM_CLONE_COMPLETE = WM_USER + 106;
-                EnterCriticalSection(&g_worker_lock);
-                g_worker.job_type = WorkerThreadState::JobType::None;
-                LeaveCriticalSection(&g_worker_lock);
-                PostMessageW(g_main_window, WM_CLONE_COMPLETE, success ? 1 : 0, 0);
+                worker_signal_complete(WorkerThreadState::JobType::Clone, WM_CLONE_COMPLETE, success);
             }
         }
     }
@@ -316,8 +328,8 @@ bool worker_start_async_fetch(const char* remote_name, bool silent) {
     if (!remote_name) return false;
     EnterCriticalSection(&g_worker_lock);
 
-    // Check if already busy
-    if (g_worker.job_type != WorkerThreadState::JobType::None) {
+    // Check if already busy (running or UI still processing completion)
+    if (worker_is_occupied_unlocked()) {
         LeaveCriticalSection(&g_worker_lock);
         return false;
     }
@@ -345,8 +357,8 @@ bool worker_start_async_push(const char* remote_name, const char* ref_name, bool
     if (!remote_name || !ref_name) return false;
     EnterCriticalSection(&g_worker_lock);
 
-    // Check if already busy
-    if (g_worker.job_type != WorkerThreadState::JobType::None) {
+    // Check if already busy (running or UI still processing completion)
+    if (worker_is_occupied_unlocked()) {
         LeaveCriticalSection(&g_worker_lock);
         return false;
     }
@@ -374,8 +386,8 @@ bool worker_start_async_pull(const char* remote_name) {
     if (!remote_name) return false;
     EnterCriticalSection(&g_worker_lock);
 
-    // Check if already busy
-    if (g_worker.job_type != WorkerThreadState::JobType::None) {
+    // Check if already busy (running or UI still processing completion)
+    if (worker_is_occupied_unlocked()) {
         LeaveCriticalSection(&g_worker_lock);
         return false;
     }
@@ -402,8 +414,8 @@ bool worker_start_async_checkout(const GitRef* ref, bool create_tracking, const 
 
     EnterCriticalSection(&g_worker_lock);
 
-    // Check if already busy
-    if (g_worker.job_type != WorkerThreadState::JobType::None) {
+    // Check if already busy (running or UI still processing completion)
+    if (worker_is_occupied_unlocked()) {
         LeaveCriticalSection(&g_worker_lock);
         return false;
     }
@@ -437,8 +449,8 @@ bool worker_start_async_clone(const char* url, const wchar_t* destination) {
 
     EnterCriticalSection(&g_worker_lock);
 
-    // Check if already busy
-    if (g_worker.job_type != WorkerThreadState::JobType::None) {
+    // Check if already busy (running or UI still processing completion)
+    if (worker_is_occupied_unlocked()) {
         LeaveCriticalSection(&g_worker_lock);
         return false;
     }
@@ -460,20 +472,30 @@ bool worker_start_async_clone(const char* url, const wchar_t* destination) {
     return true;
 }
 
-// Check if worker is currently busy
+// Check if worker is currently busy (running job or awaiting UI completion ack)
 bool worker_is_busy() {
     EnterCriticalSection(&g_worker_lock);
-    bool busy = (g_worker.job_type != WorkerThreadState::JobType::None);
+    bool busy = worker_is_occupied_unlocked();
     LeaveCriticalSection(&g_worker_lock);
     return busy;
 }
 
-// Get current worker job type
+// Get current worker job type (prefers active job; falls back to pending complete)
 WorkerJobType worker_get_job_type() {
     EnterCriticalSection(&g_worker_lock);
-    WorkerJobType job = static_cast<WorkerJobType>(g_worker.job_type);
+    WorkerJobType job = static_cast<WorkerJobType>(
+        g_worker.job_type != WorkerThreadState::JobType::None
+            ? g_worker.job_type
+            : g_worker.pending_complete);
     LeaveCriticalSection(&g_worker_lock);
     return job;
+}
+
+// UI thread: release completion barrier after copying results from worker state.
+void worker_ack_complete() {
+    EnterCriticalSection(&g_worker_lock);
+    g_worker.pending_complete = WorkerThreadState::JobType::None;
+    LeaveCriticalSection(&g_worker_lock);
 }
 
 // Get fetch progress (for UI rendering)

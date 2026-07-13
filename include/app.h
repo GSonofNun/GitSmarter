@@ -10,13 +10,13 @@
 // 7. UTF-8 / Wide Character Conversion Utilities (line 1266)
 // 8. Command Palette (line 1600)
 // 9. Worker Thread API (async operations: fetch, push, pull, checkout) (line 1709)
-// 10. File Watcher API (monitor repository for changes) (line 1766)
-// 11. Dialog Widgets API (modal dialogs: branch, auth, OAuth, stash) (line 1779)
-// 12. Timer IDs (centralized to prevent collisions) (line 1830)
-// 13. Frame-Driven Animation Timing (line 1888)
-// 14. Animation Scheduler (line 1914)
-// 15. Spring Animation (Windows Composition-style closed-form solution) (line 1968)
-// 16. Test Support (only compiled in test builds) (line 2013)
+// 10. File Watcher API (monitor repository for changes) (line 1770)
+// 11. Dialog Widgets API (modal dialogs: branch, auth, OAuth, stash) (line 1783)
+// 12. Timer IDs (centralized to prevent collisions) (line 1834)
+// 13. Frame-Driven Animation Timing (line 1893)
+// 14. Animation Scheduler (line 1919)
+// 15. Spring Animation (Windows Composition-style closed-form solution) (line 1973)
+// 16. Test Support (only compiled in test builds) (line 2018)
 //
 // </AUTO-GENERATED TOC>
 #pragma once
@@ -1728,11 +1728,15 @@ bool worker_start_async_checkout(const GitRef* ref, bool create_tracking, const 
 // Start async clone operation
 bool worker_start_async_clone(const char* url, const wchar_t* destination);
 
-// Check if worker is currently busy
+// Check if worker is currently busy (running or awaiting UI completion ack)
 bool worker_is_busy();
 
-// Get current worker job type
+// Get current worker job type (active job, or pending completion type)
 WorkerJobType worker_get_job_type();
+
+// UI handlers must call this after copying results from a WM_*_COMPLETE message
+// so a new job may start without racing the previous result/timer state.
+void worker_ack_complete();
 
 // Get progress objects (for UI rendering)
 const FetchProgress* worker_get_fetch_progress();
@@ -1844,6 +1848,7 @@ void dialog_widgets_tick(float dt);
 //  10  - CLONE_PROGRESS_TIMER_ID    Clone operation progress
 //  11  - (unused)                   Was: Animation tick timer (now self-driving)
 //  12  - OAUTH_COUNTDOWN_TIMER_ID   OAuth dialog countdown
+//  13  - EDITOR_COALESCE_TIMER_ID   Code editor undo coalescing
 //
 // ============================================================================
 
