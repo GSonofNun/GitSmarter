@@ -347,3 +347,45 @@ TEST(reset_null_inputs) {
     git_repo_close(&repo);
     cleanup_reset_test_repo();
 }
+
+// Empty tree (content length 0) must checkout successfully — delete all tracked files.
+// Canonical empty-tree SHA: 4b825dc642cb6eb9a060e54bf8d6925a980d27d3
+TEST(checkout_empty_tree_succeeds) {
+    if (!create_reset_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_reset_test_repo)) {
+        cleanup_reset_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    char empty_tree_sha[Git::SHA1_HEX_SIZE + 1] = {};
+    // Empty string is valid tree content (size 0)
+    TEST_ASSERT_TRUE(git_write_object(&repo, GitObjectType::Tree, "", 0, empty_tree_sha));
+    TEST_ASSERT_EQ(strlen(empty_tree_sha), 40u);
+
+    // Flatten must succeed with zero entries (not nullptr failure)
+    size_t empty_count = 0;
+    GitIndexEntry* empty_flat = git_read_tree_flat_alloc(&repo, empty_tree_sha, &empty_count);
+    TEST_ASSERT_TRUE(empty_flat != nullptr);
+    TEST_ASSERT_EQ(empty_count, 0u);
+    delete[] empty_flat;
+
+    char old_tree_sha[Git::SHA1_HEX_SIZE + 1] = {};
+    GitCommit head = {};
+    TEST_ASSERT_TRUE(git_read_commit(&repo, repo.head_sha, &head));
+    strcpy_s(old_tree_sha, head.tree_sha);
+
+    TEST_ASSERT_TRUE(git_checkout_tree(&repo, empty_tree_sha, old_tree_sha, nullptr));
+
+    // A previously tracked file should be gone after checkout to empty tree
+    wchar_t file1_path[512];
+    swprintf(file1_path, _countof(file1_path), L"%s\\file1.txt", g_reset_test_repo);
+    DWORD attrs = GetFileAttributesW(file1_path);
+    TEST_ASSERT_TRUE(attrs == INVALID_FILE_ATTRIBUTES);
+
+    git_repo_close(&repo);
+    cleanup_reset_test_repo();
+}

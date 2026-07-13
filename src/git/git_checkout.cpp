@@ -3,8 +3,8 @@
 //
 // 1. Parallel Checkout Infrastructure (line 13)
 // 2. PULL OPERATIONS (fast-forward only) (line 628)
-// 3. Branch Checkout (line 1571)
-// 4. Reset Operations (line 1804)
+// 3. Branch Checkout (line 1570)
+// 4. Reset Operations (line 1803)
 //
 // </AUTO-GENERATED TOC>
 #include "app.h"
@@ -777,7 +777,8 @@ bool git_checkout_tree(GitRepository* repo, const char* new_tree_sha,
 
     int64_t start_time = GetTickCount64();
 
-    // Flatten both trees with dynamic allocation (no MAX_TREE_ENTRIES silent truncate)
+    // Flatten both trees with dynamic allocation (no MAX_TREE_ENTRIES silent truncate).
+    // Empty trees return a non-null zero-length array (valid); nullptr is failure.
     int64_t tree_walk_start = GetTickCount64();
     size_t new_count = 0;
     GitIndexEntry* new_tree = git_read_tree_flat_alloc(repo, new_tree_sha, &new_count);
@@ -791,8 +792,6 @@ bool git_checkout_tree(GitRepository* repo, const char* new_tree_sha,
     if (old_tree_sha && old_tree_sha[0]) {
         old_tree = git_read_tree_flat_alloc(repo, old_tree_sha, &old_count);
         if (!old_tree) {
-            // Empty tree is valid (alloc returns nullptr with count 0 only on failure;
-            // treat failure as hard error — cannot safely delete vs skip)
             LOG("git_checkout_tree: failed to read old tree %s", old_tree_sha);
             delete[] new_tree;
             return false;

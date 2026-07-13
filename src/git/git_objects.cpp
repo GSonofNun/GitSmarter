@@ -1899,15 +1899,18 @@ static char* read_pack_object_by_sha(GitRepository* repo, const char* sha,
 
 static char* read_tree_object_data(GitRepository* repo, const char* tree_sha,
                                    size_t* out_size) {
-    // Read tree object - try loose first, then pack files
+    // Read tree object - try loose first, then pack files.
+    // Empty trees are valid: content length is 0 with a non-null buffer
+    // ("tree 0\0"). Do not treat size==0 as failure (that rejected the
+    // canonical empty tree 4b825dc642cb6eb9a060e54bf8d6925a980d27d3).
     char* data = nullptr;
-    GitObjectType type;
+    GitObjectType type = GitObjectType::Invalid;
     size_t size = read_loose_object(repo, tree_sha, &data, &type);
 
-    if (size == 0 || !data) {
-        int pack_type;
+    if (!data) {
+        int pack_type = 0;
         data = read_pack_object_by_sha(repo, tree_sha, &pack_type, &size);
-        if (!data || size == 0) {
+        if (!data) {
             if (out_size) *out_size = 0;
             return nullptr;
         }
