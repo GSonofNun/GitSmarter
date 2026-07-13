@@ -541,6 +541,30 @@ const char* worker_get_clone_url() {
     return g_worker.clone_url;
 }
 
+// Remote name for the last/current job (fetch/push/pull). Retained after job_type→None.
+bool worker_get_remote_name(char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    EnterCriticalSection(&g_worker_lock);
+    strncpy_s(out, out_size, g_worker.remote_name, _TRUNCATE);
+    LeaveCriticalSection(&g_worker_lock);
+    return out[0] != '\0';
+}
+
+bool worker_get_silent() {
+    EnterCriticalSection(&g_worker_lock);
+    bool silent = g_worker.silent;
+    LeaveCriticalSection(&g_worker_lock);
+    return silent;
+}
+
+bool worker_get_checkout_ref_name(char* out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+    EnterCriticalSection(&g_worker_lock);
+    strncpy_s(out, out_size, g_worker.checkout_ref_name, _TRUNCATE);
+    LeaveCriticalSection(&g_worker_lock);
+    return out[0] != '\0';
+}
+
 // Initialize worker thread
 bool worker_init() {
     InitializeCriticalSection(&g_worker_lock);
