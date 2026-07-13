@@ -2,9 +2,9 @@
 // Table of Contents
 //
 // 1. Parallel Checkout Infrastructure (line 13)
-// 2. PULL OPERATIONS (fast-forward only) (line 624)
-// 3. Branch Checkout (line 1567)
-// 4. Reset Operations (line 1800)
+// 2. PULL OPERATIONS (fast-forward only) (line 628)
+// 3. Branch Checkout (line 1571)
+// 4. Reset Operations (line 1804)
 //
 // </AUTO-GENERATED TOC>
 #include "app.h"
@@ -228,9 +228,12 @@ static bool build_index_from_checkout(
 
     if (!out_index) return false;
 
-    // Initialize index
+    // Initialize index. Value-initialize entries so stage (and other fields)
+    // are 0 — git_index_write serializes stage in flags bits 12-13; garbage
+    // stages make a fresh clone look unmerged (status skip / write-tree fail).
     out_index->version = 2;
-    out_index->entries = new GitIndexEntryFull[tree_count];
+    out_index->entries = new (std::nothrow) GitIndexEntryFull[tree_count]();
+    if (!out_index->entries) return false;
     out_index->capacity = static_cast<uint32_t>(tree_count);
     out_index->entry_count = 0;
 
@@ -242,10 +245,11 @@ static bool build_index_from_checkout(
         GitIndexEntry* tree_entry = &tree_entries[i];
         GitIndexEntryFull* idx_entry = &out_index->entries[out_index->entry_count];
 
-        // Copy common fields from tree
+        // Copy common fields from tree (stage remains 0 from value-init)
         strcpy_s(idx_entry->path, tree_entry->path);
         strcpy_s(idx_entry->sha, tree_entry->sha);
         idx_entry->mode = tree_entry->mode;
+        idx_entry->stage = 0;
 
         // Check if this is a submodule (mode 160000)
         if (tree_entry->mode == 0160000) {
