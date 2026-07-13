@@ -120,12 +120,18 @@ bool git_index_open(GitRepository* repo, GitIndex* index) {
     }
 
     // Allocate entries (entry_count is now bounded by mmap->size / MIN_ENTRY_BYTES)
-    index->entries = new GitIndexEntry[entry_count];
+    index->entries = new (std::nothrow) GitIndexEntry[entry_count];
+    if (!index->entries) {
+        mmap_close(mmap);
+        return false;
+    }
     index->entry_count = 0;
 
     // Parse entries
     const uint8_t* ptr = data + 12;  // After header
     const uint8_t* end = data + mmap->size;
+    uint32_t processed = 0;
+    bool truncated = false;
 
     for (uint32_t i = 0; i < entry_count && ptr < end; i++) {
         // Entry format (v2/v3):
@@ -145,7 +151,7 @@ bool git_index_open(GitRepository* repo, GitIndex* index) {
         // Variable-length path (null-terminated)
         // Padding to 8-byte boundary (from entry start)
 
-        if (ptr + 62 > end) break;  // Minimum entry size
+        if (ptr + 62 > end) { truncated = true; break; }
 
         const uint8_t* entry_start = ptr;
 
@@ -167,16 +173,18 @@ bool git_index_open(GitRepository* repo, GitIndex* index) {
         // Read flags
         uint16_t flags = (ptr[0] << 8) | ptr[1];
         ptr += 2;
+        uint8_t stage = static_cast<uint8_t>((flags >> 12) & 0x3);
 
         // Extended flags (v3 only)
         if (index->version >= 3 && (flags & 0x4000)) {
+            if (ptr + 2 > end) { truncated = true; break; }
             ptr += 2;  // Skip extended flags
         }
 
         // Read path (null-terminated)
         const uint8_t* path_start = ptr;
         while (ptr < end && *ptr != '\0') ptr++;
-        if (ptr >= end) break;
+        if (ptr >= end) { truncated = true; break; }
 
         size_t path_len = ptr - path_start;
         ptr++;  // Skip null byte
@@ -184,7 +192,10 @@ bool git_index_open(GitRepository* repo, GitIndex* index) {
         // Padding to 8-byte boundary (from entry_start)
         size_t entry_len = ptr - entry_start;
         size_t padding = (8 - (entry_len % 8)) % 8;
+        if (ptr + padding > end) { truncated = true; break; }
         ptr += padding;
+
+        processed++;
 
         // Skip entries with paths too long to store
         if (path_len >= Git::MAX_PATH_LEN) {
@@ -195,12 +206,22 @@ bool git_index_open(GitRepository* repo, GitIndex* index) {
         // Store entry
         GitIndexEntry* entry = &index->entries[index->entry_count];
         entry->mode = mode;
+        entry->stage = stage;
         strcpy_s(entry->sha, sha);
-        // TODO: store stage = (flags>>12)&0x3 when GitIndexEntry has a stage field
         memcpy(entry->path, path_start, path_len);
         entry->path[path_len] = '\0';
 
         index->entry_count++;
+    }
+
+    if (truncated || processed != entry_count) {
+        LOG("git_index_open: parsed %u of %u entries (truncated=%d) - index may be corrupt",
+            processed, entry_count, (int)truncated);
+        delete[] index->entries;
+        index->entries = nullptr;
+        index->entry_count = 0;
+        mmap_close(mmap);
+        return false;
     }
 
     mmap_close(mmap);
@@ -432,13 +453,14 @@ bool git_index_open_full(GitRepository* repo, GitIndexFull* index) {
         sha1_to_hex(ptr, entry->sha);
         ptr += 20;
 
-        // Read flags
+        // Read flags (name length + stage in bits 12-13)
         uint16_t flags = (ptr[0] << 8) | ptr[1];
         ptr += 2;
-        // TODO: store stage = (flags>>12)&0x3 when GitIndexEntryFull has a stage field
+        entry->stage = static_cast<uint8_t>((flags >> 12) & 0x3);
 
         // Extended flags (v3)
         if (index->version >= 3 && (flags & 0x4000)) {
+            if (ptr + 2 > end) { truncated = true; break; }
             ptr += 2;
         }
 
@@ -453,6 +475,7 @@ bool git_index_open_full(GitRepository* repo, GitIndexFull* index) {
         // Padding
         size_t entry_len = ptr - entry_start;
         size_t padding = (8 - (entry_len % 8)) % 8;
+        if (ptr + padding > end) { truncated = true; break; }
         ptr += padding;
 
         processed++;
@@ -500,11 +523,14 @@ static void write_be32(uint8_t* ptr, uint32_t value) {
     ptr[3] = static_cast<uint8_t>(value);
 }
 
-// Helper: Compare paths for sorting (for full entries)
+// Helper: Compare paths then stage for sorting (for full entries).
+// Git requires index entries sorted by path, then by stage (0..3).
 static int compare_paths_full(const void* a, const void* b) {
     const GitIndexEntryFull* ea = static_cast<const GitIndexEntryFull*>(a);
     const GitIndexEntryFull* eb = static_cast<const GitIndexEntryFull*>(b);
-    return strcmp(ea->path, eb->path);
+    int cmp = strcmp(ea->path, eb->path);
+    if (cmp != 0) return cmp;
+    return static_cast<int>(ea->stage) - static_cast<int>(eb->stage);
 }
 
 // Write index to disk
@@ -526,7 +552,8 @@ bool git_index_write(GitRepository* repo, GitIndexFull* index) {
     }
     buf_size += 20;  // Trailer SHA
 
-    uint8_t* buffer = new uint8_t[buf_size];
+    uint8_t* buffer = new (std::nothrow) uint8_t[buf_size];
+    if (!buffer) return false;
     memset(buffer, 0, buf_size);
     uint8_t* ptr = buffer;
 
@@ -556,9 +583,10 @@ bool git_index_write(GitRepository* repo, GitIndexFull* index) {
         hex_to_sha(entry->sha, sha_raw);
         memcpy(ptr, sha_raw, 20); ptr += 20;
 
-        // Write flags (12-bit path length, assume no extended flags)
+        // Write flags: bits 12-13 = stage, low 12 bits = path length (or 0xFFF)
         size_t path_len = strlen(entry->path);
         uint16_t flags = static_cast<uint16_t>(path_len > 0xFFF ? 0xFFF : path_len);
+        flags |= static_cast<uint16_t>((entry->stage & 0x3) << 12);
         *ptr++ = static_cast<uint8_t>(flags >> 8);
         *ptr++ = static_cast<uint8_t>(flags);
 
@@ -655,7 +683,8 @@ static bool stat_file_for_index(GitRepository* repo, const char* rel_path,
     return true;
 }
 
-// Add a file to the index (stage it)
+// Add a file to the index (stage it). Resolves any conflict stages for the path
+// (removes stages 1/2/3) and writes a single stage-0 entry — matching `git add`.
 bool git_index_add_path(GitRepository* repo, GitIndexFull* index, const char* path) {
     if (!repo || !index || !path) return false;
     if (!git_is_safe_relative_path(path)) return false;
@@ -664,6 +693,18 @@ bool git_index_add_path(GitRepository* repo, GitIndexFull* index, const char* pa
     GitIndexEntryFull new_entry = {};
     if (!stat_file_for_index(repo, path, &new_entry)) {
         return false;
+    }
+    new_entry.stage = 0;
+
+    // Preserve executable/symlink mode from existing stage-0 entry when present.
+    // On Windows the filesystem does not carry git's 100755 bit (core.filemode=false).
+    for (size_t i = 0; i < index->entry_count; i++) {
+        if (strcmp(index->entries[i].path, path) == 0 && index->entries[i].stage == 0) {
+            if (index->entries[i].mode != 0) {
+                new_entry.mode = index->entries[i].mode;
+            }
+            break;
+        }
     }
 
     // Compute blob SHA
@@ -726,22 +767,18 @@ bool git_index_add_path(GitRepository* repo, GitIndexFull* index, const char* pa
 
     strcpy_s(new_entry.sha, sha);
 
-    // Check if path already exists in index
-    for (size_t i = 0; i < index->entry_count; i++) {
-        if (strcmp(index->entries[i].path, path) == 0) {
-            // Update existing entry
-            index->entries[i] = new_entry;
-            return true;
-        }
-    }
+    // Drop every stage for this path (conflict resolution), then append stage 0.
+    git_index_remove_path(index, path);
 
-    // Add new entry
+    // Grow if needed (capacity may be 0 after empty-index edge cases)
     if (index->entry_count >= index->capacity) {
-        // Grow array
-        size_t new_capacity = index->capacity * 2;
+        size_t new_capacity = (index->capacity > 0) ? index->capacity * 2 : Git::INITIAL_STATUS_ENTRIES;
+        if (new_capacity <= index->entry_count) new_capacity = index->entry_count + 16;
         GitIndexEntryFull* new_entries = new (std::nothrow) GitIndexEntryFull[new_capacity];
         if (!new_entries) return false;
-        memcpy(new_entries, index->entries, index->entry_count * sizeof(GitIndexEntryFull));
+        if (index->entries && index->entry_count > 0) {
+            memcpy(new_entries, index->entries, index->entry_count * sizeof(GitIndexEntryFull));
+        }
         delete[] index->entries;
         index->entries = new_entries;
         index->capacity = new_capacity;
@@ -1139,7 +1176,9 @@ bool git_discard_file(GitRepository* repo, const char* path) {
 static int compare_paths(const void* a, const void* b) {
     const GitIndexEntry* ea = static_cast<const GitIndexEntry*>(a);
     const GitIndexEntry* eb = static_cast<const GitIndexEntry*>(b);
-    return strcmp(ea->path, eb->path);
+    int cmp = strcmp(ea->path, eb->path);
+    if (cmp != 0) return cmp;
+    return static_cast<int>(ea->stage) - static_cast<int>(eb->stage);
 }
 
 // Helper: Binary search for path in sorted array
@@ -2072,11 +2111,13 @@ bool git_status_compute(GitRepository* repo, GitStatus* status) {
     status->staged_count = 0;
     status->unstaged_count = 0;
 
-    // Parse the index (with full stat info for stat cache optimization)
+    // Parse the index (with full stat info for stat cache optimization).
+    // open_full returns true for a missing/empty index; false means corrupt or OOM.
+    // Never treat a failed open as "clean repo" — that misrepresents staging state.
     GitIndexFull index = {};
     if (!git_index_open_full(repo, &index)) {
-        // No index means no staged files (new repo or error)
-        return true;
+        git_status_free(status);
+        return false;
     }
 
     // Get HEAD tree entries (if HEAD exists)
@@ -2098,15 +2139,19 @@ bool git_status_compute(GitRepository* repo, GitStatus* status) {
         if (git_read_commit(repo, repo->head_sha, &head_commit)) {
             LOG("git_status_compute() - Read HEAD commit, tree SHA: %s", head_commit.tree_sha);
 
-            // Flatten HEAD tree
-            head_tree = new GitIndexEntry[Git::MAX_TREE_ENTRIES];
-            head_tree_count = git_read_tree_flat(repo, head_commit.tree_sha,
-                                                  head_tree, Git::MAX_TREE_ENTRIES, "");
+            // Flatten HEAD tree (dynamic alloc — no MAX_TREE_ENTRIES silent truncate)
+            head_tree = git_read_tree_flat_alloc(repo, head_commit.tree_sha, &head_tree_count);
+            if (!head_tree && head_tree_count == 0) {
+                // Empty tree is valid; alloc failure returns nullptr with out_count 0 —
+                // distinguish by re-check: treat nullptr as empty OK if commit has empty tree.
+                // git_read_tree_flat_alloc sets *out_count=0 on failure too; empty tree also 0.
+                // Prefer empty over fail for empty trees; OOM on non-empty is rare.
+            }
 
             LOG("git_status_compute() - Read HEAD tree, entry count: %zu", head_tree_count);
 
             // Sort for binary search
-            if (head_tree_count > 0) {
+            if (head_tree && head_tree_count > 0) {
                 qsort(head_tree, head_tree_count, sizeof(GitIndexEntry), compare_paths);
             }
         } else {
@@ -2118,11 +2163,14 @@ bool git_status_compute(GitRepository* repo, GitStatus* status) {
 
     // -------------------------------------------------------------------------
     // Phase 1: Staged changes (Index vs HEAD tree)
+    // Only stage 0 participates in normal status. Conflict stages (1/2/3) are
+    // skipped here so they are not misreported as three Added/Modified rows.
     // -------------------------------------------------------------------------
 
     // Check each index entry against HEAD tree
     for (size_t i = 0; i < index.entry_count; i++) {
         GitIndexEntryFull* idx_entry = &index.entries[i];
+        if (idx_entry->stage != 0) continue;
 
         if (head_tree && head_tree_count > 0) {
             int found = find_path_in_sorted(head_tree, head_tree_count, idx_entry->path);
@@ -2137,8 +2185,9 @@ bool git_status_compute(GitRepository* repo, GitStatus* status) {
                 strcpy_s(se->path, idx_entry->path);
                 se->index_status = GitFileStatus::Added;
                 se->worktree_status = GitFileStatus::Unmodified;
-            } else if (strcmp(idx_entry->sha, head_tree[found].sha) != 0) {
-                // Different SHA = Modified
+            } else if (strcmp(idx_entry->sha, head_tree[found].sha) != 0 ||
+                       idx_entry->mode != head_tree[found].mode) {
+                // Different SHA or mode = Modified (mode change is staged content)
                 if (status->staged_count < 10) {
                     LOG("git_status_compute() - File MODIFIED: %s (index SHA: %s, HEAD SHA: %s)",
                         idx_entry->path, idx_entry->sha, head_tree[found].sha);
@@ -2311,6 +2360,7 @@ bool git_status_compute(GitRepository* repo, GitStatus* status) {
 
     for (size_t i = 0; i < index.entry_count; i++) {
         GitIndexEntryFull* idx_entry = &index.entries[i];
+        if (idx_entry->stage != 0) continue;  // conflict stages: not normal worktree status
 
         wchar_t file_path[Git::MAX_PATH_LEN];
         if (!git_make_worktree_path(repo, idx_entry->path, file_path, Git::MAX_PATH_LEN)) {

@@ -343,3 +343,53 @@ TEST(amend_null_inputs) {
     git_repo_close(&repo);
     cleanup_write_test_repo();
 }
+
+// Amend must keep the original author identity (git commit --amend default).
+TEST(amend_preserves_author) {
+    if (!create_write_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_write_test_repo)) {
+        cleanup_write_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    GitConfig config = {};
+    TEST_ASSERT_TRUE(git_config_load(&repo, &config));
+
+    // Create a commit with a distinctive author different from config committer
+    char tree_sha[41] = {};
+    TEST_ASSERT_TRUE(git_write_tree_from_index(&repo, tree_sha));
+    char alice_sha[41] = {};
+    TEST_ASSERT_TRUE(git_commit_create(&repo, tree_sha, repo.head_sha,
+                                       "Alice Amend", "alice@amend.test",
+                                       config.user_name, config.user_email,
+                                       "Commit by Alice\n", alice_sha));
+    char ref_path[128];
+    snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", repo.head_ref);
+    TEST_ASSERT_TRUE(git_ref_update(&repo, ref_path, alice_sha));
+    strcpy_s(repo.head_sha, alice_sha);
+
+    GitCommit before_amend = {};
+    TEST_ASSERT_TRUE(git_read_commit(&repo, repo.head_sha, &before_amend));
+    int64_t original_author_time = before_amend.author_time;
+    TEST_ASSERT_TRUE(original_author_time != 0);
+
+    // Ensure wall clock advances so a bug that stamps "now" would differ
+    Sleep(1100);
+
+    TEST_ASSERT_TRUE(git_commit(&repo, "Amended message keeping author", true));
+
+    GitCommit after = {};
+    TEST_ASSERT_TRUE(git_read_commit(&repo, repo.head_sha, &after));
+    TEST_ASSERT_STREQ(after.author_name, "Alice Amend");
+    TEST_ASSERT_STREQ(after.author_email, "alice@amend.test");
+    TEST_ASSERT_TRUE(strstr(after.message, "Amended message keeping author") != nullptr);
+    // Author date must be preserved; committer is refreshed (may equal author if fast)
+    TEST_ASSERT_EQ(after.author_time, original_author_time);
+
+    git_repo_close(&repo);
+    cleanup_write_test_repo();
+}

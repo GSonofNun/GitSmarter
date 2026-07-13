@@ -2,13 +2,13 @@
 // Table of Contents
 //
 // 1. Test Infrastructure (line 22)
-// 2. Section 1: Object Creation Tests (line 205)
-// 3. Section 2: Tree Building Tests (line 541)
-// 4. Section 3: Commit Creation Tests (line 780)
-// 5. Section 4: Reference Update Tests (line 1110)
-// 6. Section 5: Branch Delete Tests (line 1396)
-// 7. Section 6: Branch Rename Tests (line 1548)
-// 8. Section 7: Tag Create Tests (line 1708)
+// 2. Section 1: Object Creation Tests (line 161)
+// 3. Section 2: Tree Building Tests (line 497)
+// 4. Section 3: Commit Creation Tests (line 736)
+// 5. Section 4: Reference Update Tests (line 1066)
+// 6. Section 5: Branch Delete Tests (line 1379)
+// 7. Section 6: Branch Rename Tests (line 1531)
+// 8. Section 7: Tag Create Tests (line 1691)
 //
 // </AUTO-GENERATED TOC>
 // test_write.cpp - Write operations tests (Phase 5)
@@ -1204,6 +1204,33 @@ TEST(ref_update_null_inputs) {
 
     // Null sha
     TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/test", nullptr));
+
+    git_repo_close(&repo);
+    cleanup_write_test_repo();
+}
+
+TEST(ref_update_rejects_path_escape) {
+    if (!create_write_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_write_test_repo)) {
+        cleanup_write_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    // Must not write outside .git/refs
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/../../evil", repo.head_sha));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "not-a-ref", repo.head_sha));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs\\heads\\win", repo.head_sha));
+    // NTFS alternate data stream names use ':' — reject under .git
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/safe:stream", repo.head_sha));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/x", "not40chars"));
+    TEST_ASSERT_FALSE(git_ref_update(&repo, "refs/heads/x", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+
+    // Valid update still works
+    TEST_ASSERT_TRUE(git_ref_update(&repo, "refs/heads/safe-branch", repo.head_sha));
 
     git_repo_close(&repo);
     cleanup_write_test_repo();

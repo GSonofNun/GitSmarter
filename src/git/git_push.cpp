@@ -2,7 +2,7 @@
 // Table of Contents
 //
 // 1. PACK FILE GENERATION (for push operations) (line 17)
-// 2. OBJECT COLLECTION (for push operations) (line 197)
+// 2. OBJECT COLLECTION (for push operations) (line 202)
 //
 // </AUTO-GENERATED TOC>
 // git_push.cpp - Pack file generation and object collection for push operations
@@ -303,15 +303,23 @@ struct ShaHashSet {
 };
 
 // Forward declaration for recursive tree collection
+// out_truncated: set true if the tree walk stopped because max_objects was full
+// while entries remained (incomplete pack risk).
 static size_t collect_tree_objects_recursive(GitRepository* repo, const char* tree_sha,
                                               ObjectToSend* objects, size_t current_count,
-                                              size_t max_objects, ShaHashSet* visited);
+                                              size_t max_objects, ShaHashSet* visited,
+                                              bool* out_truncated);
 
 // Recursively collect all objects in a tree (trees and blobs)
 static size_t collect_tree_objects_recursive(GitRepository* repo, const char* tree_sha,
                                               ObjectToSend* objects, size_t current_count,
-                                              size_t max_objects, ShaHashSet* visited) {
-    if (current_count >= max_objects) return current_count;
+                                              size_t max_objects, ShaHashSet* visited,
+                                              bool* out_truncated) {
+    if (current_count >= max_objects) {
+        // Caller still needed this tree but buffer is full
+        if (out_truncated) *out_truncated = true;
+        return current_count;
+    }
     if (visited->contains(tree_sha)) return current_count;
 
     // Add tree object
@@ -325,7 +333,7 @@ static size_t collect_tree_objects_recursive(GitRepository* repo, const char* tr
     GitTreeEntry* entries = new GitTreeEntry[Git::MAX_TREE_ENTRIES];
     size_t entry_count = git_read_tree(repo, tree_sha, entries, Git::MAX_TREE_ENTRIES);
 
-    for (size_t i = 0; i < entry_count && current_count < max_objects; i++) {
+    for (size_t i = 0; i < entry_count; i++) {
         if (visited->contains(entries[i].sha)) continue;
 
         // Skip gitlinks (submodule references) - they point to commits in external repos
@@ -333,11 +341,19 @@ static size_t collect_tree_objects_recursive(GitRepository* repo, const char* tr
             continue;
         }
 
+        // Need a free slot for the next blob/subtree root
+        if (current_count >= max_objects) {
+            if (out_truncated) *out_truncated = true;
+            break;
+        }
+
         if (entries[i].mode == Git::MODE_TREE) {
             // Recursively collect subtree
             current_count = collect_tree_objects_recursive(repo, entries[i].sha,
                                                            objects, current_count,
-                                                           max_objects, visited);
+                                                           max_objects, visited,
+                                                           out_truncated);
+            if (out_truncated && *out_truncated) break;
         } else {
             // Add blob
             visited->insert(entries[i].sha);
@@ -354,7 +370,9 @@ static size_t collect_tree_objects_recursive(GitRepository* repo, const char* tr
 
 // Collect all objects needed for push (commits, trees, blobs)
 // Walks from local_sha backwards until reaching remote_sha (or root)
-// Returns number of objects collected
+// Returns number of objects collected (0..max_objects on success).
+// Returns max_objects+1 if the set would exceed max_objects (incomplete pack risk).
+// Exact fit of max_objects is success when the walk finishes completely.
 size_t git_collect_push_objects(GitRepository* repo, const char* local_sha,
                                  const char* remote_sha, ObjectToSend* objects,
                                  size_t max_objects) {
@@ -417,7 +435,16 @@ size_t git_collect_push_objects(GitRepository* repo, const char* local_sha,
     }
     strcpy_s(queue[tail++].sha, local_sha);
 
-    while (head < tail && count < max_objects) {
+    bool hit_object_limit = false;
+    while (head < tail) {
+        // Need a free slot for the next commit. count == max_objects with more
+        // queue work is overflow; count == max_objects with empty queue is OK
+        // (exact fit) — checked after the loop via head < tail.
+        if (count >= max_objects) {
+            hit_object_limit = true;
+            break;
+        }
+
         char current_sha[Git::SHA1_HEX_SIZE + 1];
         strcpy_s(current_sha, queue[head++].sha);
 
@@ -436,10 +463,17 @@ size_t git_collect_push_objects(GitRepository* repo, const char* local_sha,
         objects[count].size = 0;
         count++;
 
-        // Collect tree objects for this commit
-        if (commit.tree_sha[0] && count < max_objects) {
+        // Collect tree objects for this commit (may fill remaining slots up to max)
+        if (commit.tree_sha[0]) {
+            bool tree_truncated = false;
             count = collect_tree_objects_recursive(repo, commit.tree_sha,
-                                                    objects, count, max_objects, visited);
+                                                    objects, count, max_objects, visited,
+                                                    &tree_truncated);
+            if (tree_truncated) {
+                // Mid-tree stop: incomplete even if count == max_objects exactly
+                hit_object_limit = true;
+                break;
+            }
         }
 
         const char* parents[2] = { commit.parent_sha, commit.parent2_sha };
@@ -456,6 +490,15 @@ size_t git_collect_push_objects(GitRepository* repo, const char* local_sha,
             }
             strcpy_s(queue[tail++].sha, parents[p]);
         }
+    }
+
+    // Truncation: either mid-walk limit hit, or queue still has unprocessed tips.
+    // Exact max_objects with fully drained queue is success (not overflow).
+    if (hit_object_limit || head < tail) {
+        delete[] queue;
+        delete server_has;
+        delete visited;
+        return max_objects + 1;
     }
 
     delete[] queue;

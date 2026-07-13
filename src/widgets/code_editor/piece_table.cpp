@@ -3,8 +3,8 @@
 //
 // 1. Construction / Destruction (line 18)
 // 2. Core Operations (line 82)
-// 3. Line Operations (line 263)
-// 4. Undo/Redo (line 363)
+// 3. Line Operations (line 271)
+// 4. Undo/Redo (line 371)
 //
 // </AUTO-GENERATED TOC>
 // piece_table.cpp - Piece table implementation
@@ -111,8 +111,16 @@ void PieceTable::recalc_total_length() {
 }
 
 bool PieceTable::insert(size_t pos, const char* text, size_t len) {
-    if (pos > total_len || len == 0 || !text) {
-        return pos <= total_len; // Allow insert at end, reject only if truly out of bounds
+    // Empty insert is a no-op success when position is valid.
+    // Null text with len > 0 is a hard failure (must not report success).
+    if (pos > total_len) {
+        return false;
+    }
+    if (len == 0) {
+        return true;
+    }
+    if (!text) {
+        return false;
     }
 
     // Record position in append buffer where new text will go

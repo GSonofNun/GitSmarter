@@ -469,3 +469,46 @@ TEST(revert_null_inputs) {
     git_repo_close(&repo);
     cleanup_cherry_test_repo();
 }
+
+// Cherry-picking a commit that adds a path already present with different content
+// must report conflict (not silently overwrite).
+TEST(cherry_pick_addition_conflict) {
+    if (!create_cherry_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_cherry_test_repo)) {
+        cleanup_cherry_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    // Commit A: add unique path
+    write_test_file(g_cherry_test_repo, "pick_add.txt", "from-picked-commit\n");
+    TEST_ASSERT_TRUE(git_stage_file(&repo, "pick_add.txt"));
+    TEST_ASSERT_TRUE(git_commit(&repo, "add pick_add.txt", false));
+    char pick_sha[41];
+    strcpy_s(pick_sha, repo.head_sha);
+
+    // Reset hard to parent so pick_add is gone
+    GitCommit pick_commit = {};
+    TEST_ASSERT_TRUE(git_read_commit(&repo, pick_sha, &pick_commit));
+    TEST_ASSERT_TRUE(pick_commit.parent_sha[0] != '\0');
+    char error[256] = {};
+    TEST_ASSERT_TRUE(git_reset(&repo, pick_commit.parent_sha, ResetMode::Hard, error, sizeof(error)));
+    TEST_ASSERT_TRUE(git_read_head(&repo));
+
+    // Create conflicting content at same path on a new commit
+    write_test_file(g_cherry_test_repo, "pick_add.txt", "already-on-target\n");
+    TEST_ASSERT_TRUE(git_stage_file(&repo, "pick_add.txt"));
+    TEST_ASSERT_TRUE(git_commit(&repo, "conflicting add", false));
+
+    // Cherry-pick the first add — target has different content for same path
+    error[0] = '\0';
+    bool ok = git_cherry_pick(&repo, pick_sha, error, sizeof(error));
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_TRUE(strstr(error, "Conflict") != nullptr || strstr(error, "conflict") != nullptr);
+
+    git_repo_close(&repo);
+    cleanup_cherry_test_repo();
+}

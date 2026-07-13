@@ -2,9 +2,9 @@
 // Table of Contents
 //
 // 1. Parallel Checkout Infrastructure (line 13)
-// 2. PULL OPERATIONS (fast-forward only) (line 535)
-// 3. Branch Checkout (line 1472)
-// 4. Reset Operations (line 1705)
+// 2. PULL OPERATIONS (fast-forward only) (line 628)
+// 3. Branch Checkout (line 1577)
+// 4. Reset Operations (line 1810)
 //
 // </AUTO-GENERATED TOC>
 #include "app.h"
@@ -228,9 +228,12 @@ static bool build_index_from_checkout(
 
     if (!out_index) return false;
 
-    // Initialize index
+    // Initialize index. Value-initialize entries so stage (and other fields)
+    // are 0 — git_index_write serializes stage in flags bits 12-13; garbage
+    // stages make a fresh clone look unmerged (status skip / write-tree fail).
     out_index->version = 2;
-    out_index->entries = new GitIndexEntryFull[tree_count];
+    out_index->entries = new (std::nothrow) GitIndexEntryFull[tree_count]();
+    if (!out_index->entries) return false;
     out_index->capacity = static_cast<uint32_t>(tree_count);
     out_index->entry_count = 0;
 
@@ -242,10 +245,11 @@ static bool build_index_from_checkout(
         GitIndexEntry* tree_entry = &tree_entries[i];
         GitIndexEntryFull* idx_entry = &out_index->entries[out_index->entry_count];
 
-        // Copy common fields from tree
+        // Copy common fields from tree (stage remains 0 from value-init)
         strcpy_s(idx_entry->path, tree_entry->path);
         strcpy_s(idx_entry->sha, tree_entry->sha);
         idx_entry->mode = tree_entry->mode;
+        idx_entry->stage = 0;
 
         // Check if this is a submodule (mode 160000)
         if (tree_entry->mode == 0160000) {
@@ -559,27 +563,13 @@ bool git_sync_status(GitRepository* repo, const char* remote_name, BranchSyncSta
     snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s",
              remote_name, repo->head_ref);
 
-    // Read the remote tracking ref
+    // Loose ref first, then packed-refs (resolve_ref_sha in git_repo.cpp)
     wchar_t git_dir_wide[Git::MAX_PATH_LEN];
     utf8_to_wide_n(repo->git_dir, git_dir_wide, Git::MAX_PATH_LEN);
 
-    wchar_t ref_file[Git::MAX_PATH_LEN];
-    swprintf_s(ref_file, L"%s\\%hs", git_dir_wide, remote_ref_path);
-
-    // Convert slashes
-    for (wchar_t* p = ref_file; *p; p++) {
-        if (*p == L'/') *p = L'\\';
-    }
-
     char remote_sha[Git::SHA1_HEX_SIZE + 1] = {0};
-    char content[64];
-    size_t len = read_file(ref_file, content, sizeof(content));
-    if (len >= Git::SHA1_HEX_SIZE) {
-        memcpy(remote_sha, content, Git::SHA1_HEX_SIZE);
-        remote_sha[Git::SHA1_HEX_SIZE] = '\0';
-    } else {
-        // Remote tracking ref doesn't exist
-        return false;
+    if (!resolve_ref_sha(git_dir_wide, remote_ref_path, remote_sha)) {
+        return false;  // Remote tracking ref doesn't exist
     }
 
     const char* local_sha = repo->head_sha;
@@ -654,9 +644,12 @@ bool git_workdir_is_clean(GitRepository* repo) {
     return clean;
 }
 
-// Check if local_sha is an ancestor of remote_sha (fast-forward is possible)
-// Returns true if local can fast-forward to remote
-// Also returns the number of commits between them via out_commit_count
+// Check if local_sha is an ancestor of remote_sha (fast-forward is possible).
+// Returns true if local can fast-forward to remote (local is ancestor of remote, or equal).
+// Also returns the number of commits between them via out_commit_count.
+// Used by pull (local→remote) and by push non-FF checks (call with args swapped:
+// is_fast_forward(repo, remote, local) means remote is ancestor of local).
+// Visible across unity-build TUs (network.cpp push path).
 static bool is_fast_forward(GitRepository* repo, const char* local_sha,
                             const char* remote_sha, int* out_commit_count) {
     if (!repo || !local_sha || !remote_sha) return false;
@@ -784,22 +777,25 @@ bool git_checkout_tree(GitRepository* repo, const char* new_tree_sha,
 
     int64_t start_time = GetTickCount64();
 
-    // Flatten both trees - track tree walking time
+    // Flatten both trees with dynamic allocation (no MAX_TREE_ENTRIES silent truncate).
+    // Empty trees return a non-null zero-length array (valid); nullptr is failure.
     int64_t tree_walk_start = GetTickCount64();
-    GitIndexEntry* new_tree = new (std::nothrow) GitIndexEntry[Git::MAX_TREE_ENTRIES];
-    GitIndexEntry* old_tree = new (std::nothrow) GitIndexEntry[Git::MAX_TREE_ENTRIES];
-    if (!new_tree || !old_tree) {
-        LOG("git_checkout_tree: failed to allocate tree entries (out of memory)");
-        delete[] new_tree;
-        delete[] old_tree;
+    size_t new_count = 0;
+    GitIndexEntry* new_tree = git_read_tree_flat_alloc(repo, new_tree_sha, &new_count);
+    if (!new_tree) {
+        LOG("git_checkout_tree: failed to read new tree %s", new_tree_sha);
         return false;
     }
 
-    size_t new_count = git_read_tree_flat(repo, new_tree_sha, new_tree, Git::MAX_TREE_ENTRIES, "");
-
     size_t old_count = 0;
+    GitIndexEntry* old_tree = nullptr;
     if (old_tree_sha && old_tree_sha[0]) {
-        old_count = git_read_tree_flat(repo, old_tree_sha, old_tree, Git::MAX_TREE_ENTRIES, "");
+        old_tree = git_read_tree_flat_alloc(repo, old_tree_sha, &old_count);
+        if (!old_tree) {
+            LOG("git_checkout_tree: failed to read old tree %s", old_tree_sha);
+            delete[] new_tree;
+            return false;
+        }
     }
     int64_t tree_walk_time = GetTickCount64() - tree_walk_start;
 
@@ -812,12 +808,26 @@ bool git_checkout_tree(GitRepository* repo, const char* new_tree_sha,
     }
 
     // Phase 1: Build work items for files that need checkout
-    CheckoutWorkItem* work_items = new CheckoutWorkItem[new_count];
+    CheckoutWorkItem* work_items = new (std::nothrow) CheckoutWorkItem[new_count > 0 ? new_count : 1];
+    if (!work_items) {
+        LOG("git_checkout_tree: failed to allocate work items");
+        delete[] new_tree;
+        delete[] old_tree;
+        return false;
+    }
     uint32_t work_count = 0;
     size_t files_skipped = 0;
+    size_t unsafe_paths = 0;
 
     for (size_t i = 0; i < new_count; i++) {
         GitIndexEntry* new_entry = &new_tree[i];
+
+        // Reject paths that would escape worktree or overwrite .git metadata
+        if (!git_is_safe_relative_path(new_entry->path)) {
+            LOG("git_checkout_tree: unsafe path in tree: %s", new_entry->path);
+            unsafe_paths++;
+            continue;
+        }
 
         // Find in old tree
         int old_idx = (old_count > 0) ?
@@ -829,8 +839,8 @@ bool git_checkout_tree(GitRepository* repo, const char* new_tree_sha,
             continue;
         }
 
-        // Skip submodules (mode 160000) - they require separate initialization
-        if (new_entry->mode == 0160000) {
+        // Skip submodules (gitlink) - they require separate initialization
+        if (new_entry->mode == Git::MODE_GITLINK) {
             files_skipped++;
             continue;
         }
@@ -841,6 +851,16 @@ bool git_checkout_tree(GitRepository* repo, const char* new_tree_sha,
         strcpy_s(item->sha, new_entry->sha);
         item->mode = new_entry->mode;
         item->success = false;
+        item->case_collision = false;
+    }
+
+    // Hostile / malformed trees with unsafe paths must fail the checkout
+    if (unsafe_paths > 0) {
+        LOG("git_checkout_tree: rejecting checkout — %zu unsafe path(s) in tree", unsafe_paths);
+        delete[] work_items;
+        delete[] new_tree;
+        delete[] old_tree;
+        return false;
     }
 
     if (progress) {
@@ -1031,13 +1051,20 @@ bool git_checkout_tree_for_clone(GitRepository* repo, const char* tree_sha,
     }
     uint32_t work_count = 0;
     size_t submodule_count = 0;
+    size_t unsafe_paths = 0;
 
     for (size_t i = 0; i < tree_count; i++) {
         GitIndexEntry* entry = &tree_entries[i];
 
-        // Skip submodules (mode 160000) - they require separate initialization
-        if (entry->mode == 0160000) {
+        // Skip submodules (gitlink) - they require separate initialization
+        if (entry->mode == Git::MODE_GITLINK) {
             submodule_count++;
+            continue;
+        }
+
+        if (!git_is_safe_relative_path(entry->path)) {
+            LOG("checkout_tree_for_clone: unsafe path in tree: %s", entry->path);
+            unsafe_paths++;
             continue;
         }
 
@@ -1047,6 +1074,7 @@ bool git_checkout_tree_for_clone(GitRepository* repo, const char* tree_sha,
         strcpy_s(item->sha, entry->sha);
         item->mode = entry->mode;
         item->success = false;
+        item->case_collision = false;
         // Initialize metadata fields (will be filled during checkout)
         item->file_size = 0;
         item->ctime_sec = 0;
@@ -1055,6 +1083,13 @@ bool git_checkout_tree_for_clone(GitRepository* repo, const char* tree_sha,
         item->mtime_nsec = 0;
         item->ino = 0;
         item->dev = 0;
+    }
+
+    if (unsafe_paths > 0) {
+        LOG("checkout_tree_for_clone: rejecting — %zu unsafe path(s)", unsafe_paths);
+        delete[] work_items;
+        delete[] tree_entries;
+        return false;
     }
 
     if (progress) {
@@ -1210,37 +1245,57 @@ static bool update_index_from_tree(GitRepository* repo, const char* tree_sha) {
         return false;
     }
 
-    // Read tree into flat entries
-    GitIndexEntry* tree = new GitIndexEntry[Git::MAX_TREE_ENTRIES];
-    size_t count = git_read_tree_flat(repo, tree_sha, tree, Git::MAX_TREE_ENTRIES, "");
+    // Dynamic flatten — fixed MAX_TREE_ENTRIES buffer silently truncated large trees
+    size_t count = 0;
+    GitIndexEntry* tree = git_read_tree_flat_alloc(repo, tree_sha, &count);
+    if (!tree) {
+        git_index_unlock(repo);
+        return false;
+    }
 
     // Build full index entries with stat info
     GitIndexFull index = {};
     index.version = 2;
-    index.entries = new GitIndexEntryFull[Git::MAX_TREE_ENTRIES];
-    index.capacity = Git::MAX_TREE_ENTRIES;
+    size_t capacity = count > 0 ? count : 1;
+    index.entries = new (std::nothrow) GitIndexEntryFull[capacity];
+    if (!index.entries) {
+        delete[] tree;
+        git_index_unlock(repo);
+        return false;
+    }
+    index.capacity = static_cast<uint32_t>(capacity);
     index.entry_count = 0;
 
     for (size_t i = 0; i < count; i++) {
-        // Skip submodules: mode 160000 (Git::MODE_GITLINK).
-        // stat_file_for_index would try to stat a directory that doesn't exist
-        // as a regular file, and the entry would end up with a corrupted mode.
-        // The index entry is still recorded with synthetic zeros so git sees it.
+        // Match checkout policy: refuse the whole rebuild if any path is unsafe.
+        // Skipping would write a partial index (HEAD/index mismatch on mixed reset).
+        if (!git_is_safe_relative_path(tree[i].path)) {
+            LOG("update_index_from_tree: unsafe path in tree: %s — failing index rebuild",
+                tree[i].path);
+            delete[] tree;
+            git_index_close_full(&index);
+            git_index_unlock(repo);
+            return false;
+        }
+
+        // Submodules (gitlink): synthetic zeros — no worktree file to stat
         if (tree[i].mode == Git::MODE_GITLINK) {
             GitIndexEntryFull* entry = &index.entries[index.entry_count];
+            memset(entry, 0, sizeof(*entry));
             strcpy_s(entry->path, tree[i].path);
             strcpy_s(entry->sha, tree[i].sha);
             entry->mode = tree[i].mode;
-            // All other fields remain zero-initialized (synthetic metadata)
+            entry->stage = 0;
             index.entry_count++;
             continue;
         }
 
         GitIndexEntryFull* entry = &index.entries[index.entry_count];
-
+        memset(entry, 0, sizeof(*entry));
         strcpy_s(entry->path, tree[i].path);
         strcpy_s(entry->sha, tree[i].sha);
         entry->mode = tree[i].mode;
+        entry->stage = 0;
 
         // Get stat info from the file we just wrote
         stat_file_for_index(repo, tree[i].path, entry);
@@ -1881,5 +1936,13 @@ size_t test_collect_commit_depths(GitRepository* repo, const char* start_sha,
     }
     if (out_entries) *out_entries = reinterpret_cast<TestCommitDepth*>(entries);
     return count;
+}
+
+// Expose is_fast_forward for push-direction tests.
+// is_fast_forward(repo, A, B): true when A is an ancestor of B (or A==B).
+// Push non-FF check uses is_fast_forward(repo, remote, local).
+bool test_is_fast_forward(GitRepository* repo, const char* ancestor_sha,
+                          const char* descendant_sha) {
+    return is_fast_forward(repo, ancestor_sha, descendant_sha, nullptr);
 }
 #endif

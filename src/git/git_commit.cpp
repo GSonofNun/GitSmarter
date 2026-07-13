@@ -2,12 +2,12 @@
 // Table of Contents
 //
 // 1. Tree Building (Step 5) (line 20)
-// 2. Git Config Parsing (Step 6) (line 220)
-// 3. Commit Creation (Step 7) (line 406)
-// 4. Tag Operations (line 620)
-// 5. Cherry-Pick and Revert Operations (line 802)
+// 2. Git Config Parsing (Step 6) (line 233)
+// 3. Commit Creation (Step 7) (line 416)
+// 4. Tag Operations (line 618)
+// 5. Cherry-Pick and Revert Operations (line 777)
 // 6. Reflog Support (line 1222)
-// 7. Stash Operations (line 1565)
+// 7. Stash Operations (line 1580)
 //
 // </AUTO-GENERATED TOC>
 // git_commit.cpp - Commit operations, reflog, and stash
@@ -160,14 +160,18 @@ static bool build_tree_recursive_range(GitRepository* repo,
             }
 
             char subtree_sha[Git::SHA1_HEX_SIZE + 1];
-            if (build_tree_recursive_range(repo, entries, i, j,
+            if (!build_tree_recursive_range(repo, entries, i, j,
                                            subdir_prefix, subdir_prefix_len,
                                            subtree_sha)) {
-                TreeBuildEntry* te = &level_entries[level_count++];
-                strcpy_s(te->name, dir_name);
-                te->mode = Git::MODE_TREE;
-                strcpy_s(te->sha, subtree_sha);
+                // Must fail the whole write-tree: silently omitting a subtree
+                // produces a wrong root tree (missing files) while returning success.
+                delete[] level_entries;
+                return false;
             }
+            TreeBuildEntry* te = &level_entries[level_count++];
+            strcpy_s(te->name, dir_name);
+            te->mode = Git::MODE_TREE;
+            strcpy_s(te->sha, subtree_sha);
             i = j;
         }
     }
@@ -203,7 +207,17 @@ bool git_write_tree_from_index(GitRepository* repo, char* out_tree_sha) {
         return false;  // Empty tree not allowed
     }
 
-    // Sort index by path (required for tree building)
+    // Git refuses write-tree when the index has unmerged (stage != 0) entries.
+    for (size_t i = 0; i < index.entry_count; i++) {
+        if (index.entries[i].stage != 0) {
+            LOG("git_write_tree_from_index: unmerged stages present (path=%s stage=%u)",
+                index.entries[i].path, index.entries[i].stage);
+            git_index_close_full(&index);
+            return false;
+        }
+    }
+
+    // Sort index by path then stage (required for tree building)
     if (index.entry_count > 1) {
         qsort(index.entries, index.entry_count, sizeof(GitIndexEntryFull), compare_paths_full);
     }
@@ -404,11 +418,14 @@ bool git_config_load(GitRepository* repo, GitConfig* config) {
 // ============================================================================
 
 // Forward declaration: defined below.
+// author_time: Unix timestamp for the author line, or < 0 to use current time.
+// Committer timestamp is always "now" (matches git commit / commit --amend).
 bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
                              const char** parent_shas, size_t parent_count,
                              const char* author_name, const char* author_email,
                              const char* committer_name, const char* committer_email,
-                             const char* message, char* out_commit_sha);
+                             const char* message, char* out_commit_sha,
+                             int64_t author_time = -1);
 
 // Create a commit object
 // parent_sha can be nullptr or empty for initial commit
@@ -422,17 +439,19 @@ bool git_commit_create(GitRepository* repo, const char* tree_sha, const char* pa
     return git_commit_create_multi(repo, tree_sha, parents, parent_count,
                                    author_name, author_email,
                                    committer_name, committer_email,
-                                   message, out_commit_sha);
+                                   message, out_commit_sha, -1);
 }
 
 // Create a commit with multiple parents (for stash W commits, merges, etc.)
 // parent_shas is array of parent SHA strings, parent_count is number of parents (0-8)
+// author_time < 0 means use current time for author; committer always uses now
 // Returns: true on success, fills out_commit_sha with commit SHA
 bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
                              const char** parent_shas, size_t parent_count,
                              const char* author_name, const char* author_email,
                              const char* committer_name, const char* committer_email,
-                             const char* message, char* out_commit_sha) {
+                             const char* message, char* out_commit_sha,
+                             int64_t author_time) {
     if (!repo || !repo->is_valid || !tree_sha || !message || !out_commit_sha) return false;
     if (!author_name || !author_email || !committer_name || !committer_email) return false;
     if (parent_count > 0 && !parent_shas) return false;
@@ -441,8 +460,9 @@ bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
         return false;
     }
 
-    // Get current Unix timestamp
+    // Get current Unix timestamp (committer always "now"; author may preserve amend time)
     int64_t now = static_cast<int64_t>(time(nullptr));
+    int64_t author_ts = (author_time >= 0) ? author_time : now;
 
     // Get timezone offset
     TIME_ZONE_INFORMATION tz_info;
@@ -482,7 +502,7 @@ bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
 
     // author <name> <email> <timestamp> <timezone>
     APPEND_FMT("author %s <%s> %lld %s\n",
-               author_name, author_email, (long long)now, tz_str);
+               author_name, author_email, (long long)author_ts, tz_str);
 
     // committer <name> <email> <timestamp> <timezone>
     APPEND_FMT("committer %s <%s> %lld %s\n",
@@ -517,6 +537,28 @@ bool git_commit_create_multi(GitRepository* repo, const char* tree_sha,
 // Update a reference to point to a new SHA
 bool git_ref_update(GitRepository* repo, const char* ref_name, const char* sha) {
     if (!repo || !repo->is_valid || !ref_name || !sha) return false;
+
+    // Containment: only HEAD or refs/*; reject path escape and Windows separators
+    if (strcmp(ref_name, "HEAD") != 0) {
+        if (strncmp(ref_name, "refs/", 5) != 0) return false;
+        if (strstr(ref_name, "..") != nullptr) return false;
+        if (strchr(ref_name, '\\') != nullptr) return false;
+        // ':' creates NTFS alternate data streams (e.g. refs/heads/x:evil)
+        if (strchr(ref_name, ':') != nullptr) return false;
+        // Reject absolute-ish segments and empty path components
+        if (strstr(ref_name, "//") != nullptr) return false;
+    } else {
+        // HEAD is a single file under .git — never treat as multi-segment path escape
+    }
+
+    // Require a full 40-char hex SHA (or all-zero for unborn/special cases callers may use)
+    size_t sha_len = strlen(sha);
+    if (sha_len != Git::SHA1_HEX_SIZE) return false;
+    for (size_t i = 0; i < sha_len; i++) {
+        char c = sha[i];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
 
     wchar_t git_dir_wide[Git::MAX_PATH_LEN];
     utf8_to_wide_n(repo->git_dir, git_dir_wide, Git::MAX_PATH_LEN);
@@ -603,49 +645,11 @@ bool git_tag_exists(GitRepository* repo, const char* tag_name) {
         return true;
     }
 
-    // Check packed-refs
-    wchar_t packed_refs_path[Git::MAX_PATH_LEN];
-    make_path(packed_refs_path, Git::MAX_PATH_LEN, git_dir_wide, L"packed-refs");
-
-    constexpr size_t PACKED_REFS_BUFFER_SIZE = 1024 * 256; // 256KB
-    char* content = new char[PACKED_REFS_BUFFER_SIZE];
-    size_t bytes_read = read_file(packed_refs_path, content, PACKED_REFS_BUFFER_SIZE - 1);
-    if (bytes_read == 0) {
-        delete[] content;
-        return false;
-    }
-    content[bytes_read] = '\0';
-
-    // Build the full ref name to search for
+    // Check packed-refs via full mmap (no 256KB truncation)
     char full_ref[Git::MAX_REF_NAME + 16];
     snprintf(full_ref, sizeof(full_ref), "refs/tags/%s", tag_name);
-
-    // Search line by line
-    char* line_start = content;
-    while (*line_start) {
-        char* line_end = line_start;
-        while (*line_end && *line_end != '\n' && *line_end != '\r') line_end++;
-
-        char saved = *line_end;
-        *line_end = '\0';
-
-        // Skip comments and peeled refs
-        if (line_start[0] != '#' && line_start[0] != '^' && strlen(line_start) > 42) {
-            // Format: "<sha> <refname>"
-            char* ref_name_in_file = line_start + 41;
-            if (strcmp(ref_name_in_file, full_ref) == 0) {
-                delete[] content;
-                return true;
-            }
-        }
-
-        *line_end = saved;
-        line_start = line_end;
-        while (*line_start == '\n' || *line_start == '\r') line_start++;
-    }
-
-    delete[] content;
-    return false;
+    char sha[Git::SHA1_HEX_SIZE + 1];
+    return packed_refs_lookup_sha(git_dir_wide, full_ref, sha);
 }
 
 // Create a tag. If message is NULL, creates lightweight tag.
@@ -875,12 +879,29 @@ static bool apply_tree_changes(GitRepository* repo,
             DeleteFileW(file_path);
         } else if (new_content_sha) {
             // Modified or added file - write new content
-            // First check for conflicts
+            // Conflict checks (3-way: parent base vs target vs source)
             if (!reverse && parent_entry && target_entry) {
-                // This is a modification - check if target is same as parent (base)
-                // If target differs from parent, we have a conflict
+                // Modification: target must still match parent (base)
                 if (strcmp(target_entry->sha, parent_entry->sha) != 0) {
                     if (error_out) snprintf(error_out, error_size, "Conflict: %s modified in both branches", src.path);
+                    success = false;
+                    break;
+                }
+            }
+            if (!reverse && !parent_entry && target_entry) {
+                // Addition in picked commit: target already has path with different content
+                if (strcmp(target_entry->sha, src.sha) != 0) {
+                    if (error_out) snprintf(error_out, error_size, "Conflict: %s already exists with different content", src.path);
+                    success = false;
+                    break;
+                }
+                // Same content already present — nothing to write
+                continue;
+            }
+            if (reverse && parent_entry && target_entry) {
+                // Revert of modification: target must still match the commit being reverted
+                if (strcmp(target_entry->sha, src.sha) != 0) {
+                    if (error_out) snprintf(error_out, error_size, "Conflict: %s has local changes", src.path);
                     success = false;
                     break;
                 }
@@ -1058,19 +1079,19 @@ bool git_cherry_pick(GitRepository* repo, const char* commit_sha,
         return false;
     }
 
-    // Update HEAD
+    // Update HEAD (must succeed before caching head_sha)
     if (repo->head_detached) {
-        wchar_t git_dir_wide[Git::MAX_PATH_LEN];
-        utf8_to_wide_n(repo->git_dir, git_dir_wide, Git::MAX_PATH_LEN);
-        wchar_t head_path[Git::MAX_PATH_LEN];
-        make_path(head_path, Git::MAX_PATH_LEN, git_dir_wide, L"HEAD");
-        char head_content[Git::SHA1_HEX_SIZE + 2];
-        snprintf(head_content, sizeof(head_content), "%s\n", new_commit_sha);
-        write_file_atomic(head_path, head_content, strlen(head_content));
+        if (!git_ref_update(repo, "HEAD", new_commit_sha)) {
+            if (error_out) snprintf(error_out, error_size, "Failed to update HEAD");
+            return false;
+        }
     } else {
         char ref_path[Git::MAX_REF_NAME + 16];
         snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", repo->head_ref);
-        git_ref_update(repo, ref_path, new_commit_sha);
+        if (!git_ref_update(repo, ref_path, new_commit_sha)) {
+            if (error_out) snprintf(error_out, error_size, "Failed to update branch reference");
+            return false;
+        }
     }
 
     strncpy_s(repo->head_sha, new_commit_sha, Git::SHA1_HEX_SIZE);
@@ -1175,19 +1196,19 @@ bool git_revert(GitRepository* repo, const char* commit_sha,
         return false;
     }
 
-    // Update HEAD
+    // Update HEAD (must succeed before caching head_sha)
     if (repo->head_detached) {
-        wchar_t git_dir_wide[Git::MAX_PATH_LEN];
-        utf8_to_wide_n(repo->git_dir, git_dir_wide, Git::MAX_PATH_LEN);
-        wchar_t head_path[Git::MAX_PATH_LEN];
-        make_path(head_path, Git::MAX_PATH_LEN, git_dir_wide, L"HEAD");
-        char head_content[Git::SHA1_HEX_SIZE + 2];
-        snprintf(head_content, sizeof(head_content), "%s\n", new_commit_sha);
-        write_file_atomic(head_path, head_content, strlen(head_content));
+        if (!git_ref_update(repo, "HEAD", new_commit_sha)) {
+            if (error_out) snprintf(error_out, error_size, "Failed to update HEAD");
+            return false;
+        }
     } else {
         char ref_path[Git::MAX_REF_NAME + 16];
         snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", repo->head_ref);
-        git_ref_update(repo, ref_path, new_commit_sha);
+        if (!git_ref_update(repo, ref_path, new_commit_sha)) {
+            if (error_out) snprintf(error_out, error_size, "Failed to update branch reference");
+            return false;
+        }
     }
 
     strncpy_s(repo->head_sha, new_commit_sha, Git::SHA1_HEX_SIZE);
@@ -2122,39 +2143,138 @@ bool git_stash_create(GitRepository* repo, const StashCreateOptions* options, St
     // === Step 6: Clean working directory ===
     update_progress(StashPhase::CleaningWorkdir);
 
-    // Reset index to HEAD by using checkout which will reset the index
-    // First, read the HEAD tree entries
+    // Read HEAD tree for restoring stashed paths
     GitIndexEntry* head_tree = new GitIndexEntry[Git::MAX_TREE_ENTRIES];
     size_t head_tree_count = git_read_tree_flat(repo, head_commit.tree_sha, head_tree, Git::MAX_TREE_ENTRIES, "");
 
-    // Build a GitIndexFull from the tree entries and write it
-    GitIndexFull reset_index = {};
-    reset_index.version = 2;
-    reset_index.capacity = head_tree_count;
-    reset_index.entry_count = head_tree_count;
-    reset_index.entries = new GitIndexEntryFull[head_tree_count];
+    const bool partial_stash = (selected_paths != nullptr && selected_count > 0);
 
-    for (size_t i = 0; i < head_tree_count; i++) {
-        GitIndexEntryFull* entry = &reset_index.entries[i];
-        memset(entry, 0, sizeof(GitIndexEntryFull));
-        entry->mode = head_tree[i].mode;
-        strcpy_s(entry->sha, head_tree[i].sha);
-        strcpy_s(entry->path, head_tree[i].path);
+    if (partial_stash) {
+        // Pathspec stash: only restore the selected paths. Unselected dirty files
+        // and index entries must remain untouched (git stash push -- <path>).
+        wchar_t repo_root[Git::MAX_PATH_LEN];
+        utf8_to_wide_n(repo->path, repo_root, Git::MAX_PATH_LEN);
+
+        GitIndexFull index = {};
+        if (git_index_open_full(repo, &index)) {
+            for (size_t s = 0; s < selected_count; s++) {
+                const char* path = selected_paths[s];
+                if (!path || !path[0]) continue;
+
+                const GitIndexEntry* head_entry = nullptr;
+                for (size_t i = 0; i < head_tree_count; i++) {
+                    if (strcmp(head_tree[i].path, path) == 0) {
+                        head_entry = &head_tree[i];
+                        break;
+                    }
+                }
+
+                wchar_t file_path[Git::MAX_PATH_LEN];
+                if (!git_make_worktree_path(repo, path, file_path, Git::MAX_PATH_LEN)) {
+                    continue;
+                }
+
+                if (head_entry) {
+                    size_t blob_size = 0;
+                    char* blob = git_read_blob(repo, head_entry->sha, &blob_size);
+                    if (blob) {
+                        if (git_ensure_worktree_parent_dirs(file_path, repo_root)) {
+                            write_file_atomic(file_path, blob, blob_size);
+                        }
+                        delete[] blob;
+                    }
+
+                    // Point index entry at HEAD version (or add if missing)
+                    bool updated = false;
+                    for (size_t i = 0; i < index.entry_count; i++) {
+                        if (strcmp(index.entries[i].path, path) == 0 && index.entries[i].stage == 0) {
+                            strcpy_s(index.entries[i].sha, head_entry->sha);
+                            index.entries[i].mode = head_entry->mode;
+                            stat_file_for_index(repo, path, &index.entries[i]);
+                            // stat_file_for_index preserves non-zero mode; re-assert tree mode
+                            index.entries[i].mode = head_entry->mode;
+                            updated = true;
+                            break;
+                        }
+                    }
+                    if (!updated) {
+                        // Grow if needed
+                        if (index.entry_count >= index.capacity) {
+                            size_t new_cap = index.capacity ? index.capacity * 2 : 64;
+                            GitIndexEntryFull* grown = new (std::nothrow) GitIndexEntryFull[new_cap];
+                            if (grown) {
+                                if (index.entries && index.entry_count > 0) {
+                                    memcpy(grown, index.entries, index.entry_count * sizeof(GitIndexEntryFull));
+                                }
+                                delete[] index.entries;
+                                index.entries = grown;
+                                index.capacity = new_cap;
+                            }
+                        }
+                        if (index.entry_count < index.capacity) {
+                            GitIndexEntryFull* e = &index.entries[index.entry_count++];
+                            memset(e, 0, sizeof(*e));
+                            strcpy_s(e->path, path);
+                            strcpy_s(e->sha, head_entry->sha);
+                            e->mode = head_entry->mode;
+                            e->stage = 0;
+                            stat_file_for_index(repo, path, e);
+                            e->mode = head_entry->mode;
+                        }
+                    }
+                } else {
+                    // Not in HEAD: staged new file and/or untracked. Only remove from the
+                    // worktree if the path was actually part of the stash:
+                    //  - staged-add (present in index) is always in the I/W commits
+                    //  - pure untracked is only stashed when include_untracked is set
+                    bool in_index = false;
+                    for (size_t i = 0; i < index.entry_count; i++) {
+                        if (strcmp(index.entries[i].path, path) == 0) {
+                            in_index = true;
+                            break;
+                        }
+                    }
+                    if (in_index || include_untracked) {
+                        DeleteFileW(file_path);
+                        git_index_remove_path(&index, path);
+                    }
+                }
+            }
+            if (!git_index_write(repo, &index)) {
+                LOG("git_stash_create: Warning - failed to write index after partial clean");
+            }
+            git_index_close_full(&index);
+        } else {
+            LOG("git_stash_create: Warning - failed to open index for partial clean");
+        }
+    } else {
+        // Full stash: reset entire index to HEAD and checkout whole tree
+        GitIndexFull reset_index = {};
+        reset_index.version = 2;
+        reset_index.capacity = head_tree_count > 0 ? head_tree_count : 1;
+        reset_index.entry_count = head_tree_count;
+        reset_index.entries = new GitIndexEntryFull[reset_index.capacity];
+
+        for (size_t i = 0; i < head_tree_count; i++) {
+            GitIndexEntryFull* entry = &reset_index.entries[i];
+            memset(entry, 0, sizeof(GitIndexEntryFull));
+            entry->mode = head_tree[i].mode;
+            strcpy_s(entry->sha, head_tree[i].sha);
+            strcpy_s(entry->path, head_tree[i].path);
+        }
+
+        git_index_write(repo, &reset_index);
+        git_index_close_full(&reset_index);
+
+        if (!git_checkout_tree(repo, head_commit.tree_sha, nullptr, nullptr)) {
+            // Non-fatal for stash - stash was created but workdir not cleaned
+            LOG("git_stash_create: Warning - failed to clean working directory");
+        }
     }
-
-    // Write the clean index
-    git_index_write(repo, &reset_index);
-    git_index_close_full(&reset_index);
 
     delete[] head_tree;
 
-    // Checkout HEAD tree to working directory
-    if (!git_checkout_tree(repo, head_commit.tree_sha, nullptr, nullptr)) {
-        // Non-fatal for stash - stash was created but workdir not cleaned
-        LOG("git_stash_create: Warning - failed to clean working directory");
-    }
-
-    // Delete untracked files if they were stashed
+    // Delete untracked files if they were stashed (respects selection)
     if (include_untracked && untracked_paths && untracked_count > 0) {
         git_delete_untracked_files(repo, untracked_paths, untracked_count, selected_paths, selected_count);
     }
@@ -2364,10 +2484,33 @@ bool git_stash_apply(GitRepository* repo, int stash_index,
                     }
                 }
 
-                if (current_matches_base || !base_entry) {
-                    // Safe to apply stash version
-                    if (git_ensure_worktree_parent_dirs(worktree_path, repo_root)) {
-                        write_file_atomic(worktree_path, stash_content, stash_size);
+                // Safe when current matches base, or new file in stash that is
+                // identical to existing worktree content. Different worktree
+                // content for a stash-added path is a conflict (do not overwrite).
+                bool current_matches_stash =
+                    (current_size == stash_size &&
+                     memcmp(current_content, stash_content, current_size) == 0);
+
+                if (current_matches_base || (current_matches_stash)) {
+                    // Already at desired content, or clean base — write stash version
+                    if (!current_matches_stash) {
+                        if (git_ensure_worktree_parent_dirs(worktree_path, repo_root)) {
+                            write_file_atomic(worktree_path, stash_content, stash_size);
+                        }
+                    }
+                } else if (!base_entry && !current_matches_stash) {
+                    // Stash added this path; worktree has different content
+                    if (is_binary_content(current_content, current_size) ||
+                        is_binary_content(stash_content, stash_size)) {
+                        had_conflicts = true;
+                        conflict_count++;
+                        LOG("git_stash_apply: Binary conflict in %s (stash-add)", stash_entry->path);
+                    } else {
+                        write_conflict_file(repo, stash_entry->path,
+                                            current_content, current_size,
+                                            stash_content, stash_size);
+                        had_conflicts = true;
+                        conflict_count++;
                     }
                 } else {
                     // Conflict: current working tree modified differently than stash
@@ -2657,21 +2800,32 @@ bool git_commit(GitRepository* repo, const char* message, bool amend) {
         return false;
     }
 
-    // Determine parent commit
+    // Determine parent commit and author (amend preserves original author)
     char parent_sha[Git::SHA1_HEX_SIZE + 1] = {0};
-
     char parent2_sha[Git::SHA1_HEX_SIZE + 1] = {0};
     bool is_merge_amend = false;
+    const char* author_name = config.user_name;
+    const char* author_email = config.user_email;
+    GitCommit head_commit = {};
 
     if (amend && repo->head_sha[0] != '\0') {
-        // Amend: use parent(s) of current HEAD
-        GitCommit head_commit = {};
-        if (git_read_commit(repo, repo->head_sha, &head_commit)) {
-            strcpy_s(parent_sha, head_commit.parent_sha);
-            if (head_commit.parent2_sha[0] != '\0') {
-                strcpy_s(parent2_sha, head_commit.parent2_sha);
-                is_merge_amend = true;
-            }
+        // Amend: use parent(s) of current HEAD; fail if HEAD unreadable
+        // (do not fall through to an accidental root commit).
+        if (!git_read_commit(repo, repo->head_sha, &head_commit)) {
+            LOG_WARN("git_commit: amend failed — could not read HEAD %.7s", repo->head_sha);
+            return false;
+        }
+        strcpy_s(parent_sha, head_commit.parent_sha);
+        if (head_commit.parent2_sha[0] != '\0') {
+            strcpy_s(parent2_sha, head_commit.parent2_sha);
+            is_merge_amend = true;
+        }
+        // Match git commit --amend: keep original author; refresh committer only
+        if (head_commit.author_name[0] != '\0') {
+            author_name = head_commit.author_name;
+        }
+        if (head_commit.author_email[0] != '\0') {
+            author_email = head_commit.author_email;
         }
     } else if (repo->head_sha[0] != '\0') {
         // Normal commit: current HEAD is parent
@@ -2681,17 +2835,18 @@ bool git_commit(GitRepository* repo, const char* message, bool amend) {
 
     // Create commit object
     char commit_sha[Git::SHA1_HEX_SIZE + 1];
-    if (is_merge_amend) {
+    if (amend) {
+        // Preserve original author timestamp (git commit --amend); committer is "now"
         const char* parents[2] = { parent_sha, parent2_sha };
-        size_t parent_count = 2;
+        size_t parent_count = is_merge_amend ? 2u : (parent_sha[0] != '\0' ? 1u : 0u);
         if (!git_commit_create_multi(repo, tree_sha, parents, parent_count,
+                                     author_name, author_email,
                                      config.user_name, config.user_email,
-                                     config.user_name, config.user_email,
-                                     message, commit_sha)) {
+                                     message, commit_sha, head_commit.author_time)) {
             return false;
         }
     } else if (!git_commit_create(repo, tree_sha, parent_sha,
-                                   config.user_name, config.user_email,
+                                   author_name, author_email,
                                    config.user_name, config.user_email,
                                    message, commit_sha)) {
         return false;

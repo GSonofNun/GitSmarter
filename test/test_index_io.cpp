@@ -836,3 +836,245 @@ TEST(index_io_null_inputs) {
     char sha[Git::SHA1_HEX_SIZE + 1];
     TEST_ASSERT_FALSE(git_index_get_sha(&repo, nullptr, sha));
 }
+
+// Test: Conflict stages survive write/read roundtrip (flags bits 12-13)
+TEST(index_io_stage_bits_roundtrip) {
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, INDEX_TEST_REPO_PATH)) {
+        TEST_SKIP("Fixture repo not available");
+        return;
+    }
+
+    GitIndexFull original = {};
+    if (!git_index_open_full(&repo, &original)) {
+        git_repo_close(&repo);
+        TEST_SKIP("Could not open fixture index");
+        return;
+    }
+
+    // Build a synthetic conflicted index: stages 1,2,3 for conflict.txt + stage 0 for keep.txt
+    GitIndexFull conflicted = {};
+    conflicted.version = 2;
+    conflicted.capacity = 4;
+    conflicted.entry_count = 4;
+    conflicted.entries = new GitIndexEntryFull[4];
+    memset(conflicted.entries, 0, sizeof(GitIndexEntryFull) * 4);
+
+    auto fill = [](GitIndexEntryFull* e, const char* path, uint8_t stage, const char* sha) {
+        e->mode = Git::MODE_FILE;
+        e->stage = stage;
+        e->file_size = 10;
+        e->mtime_sec = 1;
+        strcpy_s(e->path, path);
+        strcpy_s(e->sha, sha);
+    };
+    fill(&conflicted.entries[0], "conflict.txt", 1, FIXTURE_FILE1_SHA);
+    fill(&conflicted.entries[1], "conflict.txt", 2, FIXTURE_FILE2_SHA);
+    fill(&conflicted.entries[2], "conflict.txt", 3, FIXTURE_FEATURE_SHA);
+    fill(&conflicted.entries[3], "keep.txt", 0, FIXTURE_FILE1_SHA);
+
+    if (!git_index_lock(&repo, 3000)) {
+        delete[] conflicted.entries;
+        git_index_close_full(&original);
+        git_repo_close(&repo);
+        TEST_SKIP("Could not lock index");
+        return;
+    }
+
+    bool wrote = git_index_write(&repo, &conflicted);
+    TEST_ASSERT_TRUE(wrote);
+
+    GitIndexFull readback = {};
+    bool opened = git_index_open_full(&repo, &readback);
+    TEST_ASSERT_TRUE(opened);
+    TEST_ASSERT_EQ(readback.entry_count, (size_t)4);
+
+    // Sorted by path then stage: conflict 1,2,3 then keep 0
+    TEST_ASSERT_STREQ(readback.entries[0].path, "conflict.txt");
+    TEST_ASSERT_EQ(readback.entries[0].stage, (uint8_t)1);
+    TEST_ASSERT_STREQ(readback.entries[1].path, "conflict.txt");
+    TEST_ASSERT_EQ(readback.entries[1].stage, (uint8_t)2);
+    TEST_ASSERT_STREQ(readback.entries[2].path, "conflict.txt");
+    TEST_ASSERT_EQ(readback.entries[2].stage, (uint8_t)3);
+    TEST_ASSERT_STREQ(readback.entries[3].path, "keep.txt");
+    TEST_ASSERT_EQ(readback.entries[3].stage, (uint8_t)0);
+
+    // Restore fixture index
+    git_index_write(&repo, &original);
+    git_index_unlock(&repo);
+
+    git_index_close_full(&readback);
+    delete[] conflicted.entries;
+    git_index_close_full(&original);
+    git_repo_close(&repo);
+}
+
+// Test: git_index_add_path clears conflict stages and leaves a single stage-0 entry
+// (exercises the full add_path path, not only remove_path)
+TEST(index_io_add_path_resolves_conflict_stages) {
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, INDEX_TEST_REPO_PATH)) {
+        TEST_SKIP("Fixture repo not available");
+        return;
+    }
+
+    GitIndexFull index = {};
+    if (!git_index_open_full(&repo, &index)) {
+        git_repo_close(&repo);
+        TEST_SKIP("Could not open index");
+        return;
+    }
+
+    // Replace file1.txt's stage-0 entry with synthetic stages 1/2/3 (conflicted)
+    git_index_remove_path(&index, "file1.txt");
+    if (index.entry_count + 3 > index.capacity) {
+        git_index_close_full(&index);
+        git_repo_close(&repo);
+        TEST_SKIP("index capacity unexpected");
+        return;
+    }
+    for (uint8_t stage = 1; stage <= 3; stage++) {
+        GitIndexEntryFull* e = &index.entries[index.entry_count++];
+        memset(e, 0, sizeof(*e));
+        e->mode = Git::MODE_FILE;
+        e->stage = stage;
+        e->file_size = 10;
+        strcpy_s(e->path, "file1.txt");
+        strcpy_s(e->sha, stage == 1 ? FIXTURE_FILE1_SHA :
+                         stage == 2 ? FIXTURE_FILE2_SHA : FIXTURE_FEATURE_SHA);
+    }
+
+    size_t stages_before = 0;
+    for (size_t i = 0; i < index.entry_count; i++) {
+        if (strcmp(index.entries[i].path, "file1.txt") == 0) stages_before++;
+    }
+    TEST_ASSERT_EQ(stages_before, (size_t)3);
+
+    // Real worktree file exists in fixture — add_path should resolve to one stage-0
+    bool added = git_index_add_path(&repo, &index, "file1.txt");
+    TEST_ASSERT_TRUE(added);
+
+    size_t stages_after = 0;
+    uint8_t only_stage = 255;
+    for (size_t i = 0; i < index.entry_count; i++) {
+        if (strcmp(index.entries[i].path, "file1.txt") == 0) {
+            stages_after++;
+            only_stage = index.entries[i].stage;
+        }
+    }
+    TEST_ASSERT_EQ(stages_after, (size_t)1);
+    TEST_ASSERT_EQ(only_stage, (uint8_t)0);
+
+    // Do not persist conflicted/repaired index to fixture
+    git_index_close_full(&index);
+    git_repo_close(&repo);
+}
+
+// Test: Corrupt index SHA trailer makes open fail; status must not report clean
+TEST(index_io_corrupt_checksum_rejected) {
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, INDEX_TEST_REPO_PATH)) {
+        TEST_SKIP("Fixture repo not available");
+        return;
+    }
+
+    wchar_t index_path[Git::MAX_PATH_LEN];
+    wchar_t git_dir_wide[Git::MAX_PATH_LEN];
+    utf8_to_wide_n(repo.git_dir, git_dir_wide, Git::MAX_PATH_LEN);
+    wcscpy_s(index_path, git_dir_wide);
+    wcscat_s(index_path, L"\\index");
+
+    MemoryMap* mmap = mmap_open(index_path);
+    if (!mmap || !mmap->data || mmap->size < 32) {
+        mmap_close(mmap);
+        git_repo_close(&repo);
+        TEST_SKIP("No index file");
+        return;
+    }
+
+    size_t size = mmap->size;
+    uint8_t* good = new uint8_t[size];
+    uint8_t* bad = new uint8_t[size];
+    memcpy(good, mmap->data, size);
+    memcpy(bad, mmap->data, size);
+    mmap_close(mmap);
+
+    bad[size - 1] ^= 0xFF;
+    TEST_ASSERT_TRUE(write_file_atomic(index_path, bad, size));
+    delete[] bad;
+
+    GitIndexFull idx = {};
+    TEST_ASSERT_FALSE(git_index_open_full(&repo, &idx));
+
+    GitStatus status = {};
+    TEST_ASSERT_FALSE(git_status_compute(&repo, &status));
+    git_status_free(&status);
+
+    // Restore fixture index
+    TEST_ASSERT_TRUE(write_file_atomic(index_path, good, size));
+    delete[] good;
+
+    // Sanity: open works again
+    TEST_ASSERT_TRUE(git_index_open_full(&repo, &idx));
+    git_index_close_full(&idx);
+    git_repo_close(&repo);
+}
+
+// Test: Mode preserved when re-staging an existing executable entry (Windows filemode)
+TEST(index_io_add_preserves_executable_mode) {
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, INDEX_TEST_REPO_PATH)) {
+        TEST_SKIP("Fixture repo not available");
+        return;
+    }
+
+    GitIndexFull index = {};
+    if (!git_index_open_full(&repo, &index)) {
+        git_repo_close(&repo);
+        TEST_SKIP("Could not open index");
+        return;
+    }
+
+    // Find script.sh (executable in fixture)
+    int script_idx = -1;
+    for (size_t i = 0; i < index.entry_count; i++) {
+        if (strcmp(index.entries[i].path, "script.sh") == 0) {
+            script_idx = (int)i;
+            break;
+        }
+    }
+    if (script_idx < 0) {
+        git_index_close_full(&index);
+        git_repo_close(&repo);
+        TEST_SKIP("script.sh not in fixture index");
+        return;
+    }
+
+    TEST_ASSERT_EQ(index.entries[script_idx].mode, Git::MODE_EXECUTABLE);
+
+    if (!git_index_lock(&repo, 3000)) {
+        git_index_close_full(&index);
+        git_repo_close(&repo);
+        TEST_SKIP("lock failed");
+        return;
+    }
+
+    // Re-stage without content change should keep 100755
+    bool added = git_index_add_path(&repo, &index, "script.sh");
+    TEST_ASSERT_TRUE(added);
+
+    bool found = false;
+    for (size_t i = 0; i < index.entry_count; i++) {
+        if (strcmp(index.entries[i].path, "script.sh") == 0 && index.entries[i].stage == 0) {
+            TEST_ASSERT_EQ(index.entries[i].mode, Git::MODE_EXECUTABLE);
+            found = true;
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(found);
+
+    // Do not write back — release lock without persisting (or write original)
+    git_index_unlock(&repo);
+    git_index_close_full(&index);
+    git_repo_close(&repo);
+}

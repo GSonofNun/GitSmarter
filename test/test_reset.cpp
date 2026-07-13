@@ -347,3 +347,108 @@ TEST(reset_null_inputs) {
     git_repo_close(&repo);
     cleanup_reset_test_repo();
 }
+
+// Empty tree (content length 0) must checkout successfully — delete all tracked files.
+// Canonical empty-tree SHA: 4b825dc642cb6eb9a060e54bf8d6925a980d27d3
+TEST(checkout_empty_tree_succeeds) {
+    if (!create_reset_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_reset_test_repo)) {
+        cleanup_reset_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    char empty_tree_sha[Git::SHA1_HEX_SIZE + 1] = {};
+    // Empty string is valid tree content (size 0)
+    TEST_ASSERT_TRUE(git_write_object(&repo, GitObjectType::Tree, "", 0, empty_tree_sha));
+    TEST_ASSERT_EQ(strlen(empty_tree_sha), 40u);
+
+    // Flatten must succeed with zero entries (not nullptr failure)
+    size_t empty_count = 0;
+    GitIndexEntry* empty_flat = git_read_tree_flat_alloc(&repo, empty_tree_sha, &empty_count);
+    TEST_ASSERT_TRUE(empty_flat != nullptr);
+    TEST_ASSERT_EQ(empty_count, 0u);
+    delete[] empty_flat;
+
+    char old_tree_sha[Git::SHA1_HEX_SIZE + 1] = {};
+    GitCommit head = {};
+    TEST_ASSERT_TRUE(git_read_commit(&repo, repo.head_sha, &head));
+    strcpy_s(old_tree_sha, head.tree_sha);
+
+    TEST_ASSERT_TRUE(git_checkout_tree(&repo, empty_tree_sha, old_tree_sha, nullptr));
+
+    // A previously tracked file should be gone after checkout to empty tree
+    wchar_t file1_path[512];
+    swprintf(file1_path, _countof(file1_path), L"%s\\file1.txt", g_reset_test_repo);
+    DWORD attrs = GetFileAttributesW(file1_path);
+    TEST_ASSERT_TRUE(attrs == INVALID_FILE_ATTRIBUTES);
+
+    git_repo_close(&repo);
+    cleanup_reset_test_repo();
+}
+
+// Mixed reset must fail (and roll HEAD back) if the target tree has unsafe paths.
+// Skipping those paths would leave an index that cannot represent HEAD.
+TEST(reset_mixed_fails_on_unsafe_tree_path) {
+    if (!create_reset_test_repo()) {
+        TEST_SKIP("Could not create temp test repo");
+    }
+
+    GitRepository repo = {};
+    if (!git_repo_open(&repo, g_reset_test_repo)) {
+        cleanup_reset_test_repo();
+        TEST_SKIP("Could not open temp repo");
+    }
+
+    char original_head[Git::SHA1_HEX_SIZE + 1];
+    strcpy_s(original_head, repo.head_sha);
+
+    GitConfig config = {};
+    TEST_ASSERT_TRUE(git_config_load(&repo, &config));
+
+    // Blob used by both safe and hostile tree entries
+    const char* blob_content = "hostile-tree-blob\n";
+    char blob_sha[41] = {};
+    TEST_ASSERT_TRUE(git_write_object(&repo, GitObjectType::Blob,
+                                      blob_content, strlen(blob_content), blob_sha));
+    uint8_t blob_raw[20];
+    hex_to_sha(blob_sha, blob_raw);
+
+    // Tree: safe file + ".git/config" (rejected by path safety)
+    uint8_t tree_buf[256];
+    uint8_t* p = tree_buf;
+    auto append_entry = [&](const char* mode_name) {
+        size_t n = strlen(mode_name);
+        memcpy(p, mode_name, n + 1);
+        p += n + 1;
+        memcpy(p, blob_raw, 20);
+        p += 20;
+    };
+    append_entry("100644 ok.txt");
+    append_entry("100644 .git/config");
+    size_t tree_size = static_cast<size_t>(p - tree_buf);
+
+    char tree_sha[41] = {};
+    TEST_ASSERT_TRUE(git_write_object(&repo, GitObjectType::Tree,
+                                      tree_buf, tree_size, tree_sha));
+
+    char commit_sha[41] = {};
+    TEST_ASSERT_TRUE(git_commit_create(&repo, tree_sha, repo.head_sha,
+                                       config.user_name, config.user_email,
+                                       config.user_name, config.user_email,
+                                       "commit with unsafe path\n", commit_sha));
+    // Leave as dangling commit (do not update HEAD) — reset will target it
+    char error[256] = {};
+    TEST_ASSERT_FALSE(git_reset(&repo, commit_sha, ResetMode::Mixed, error, sizeof(error)));
+    TEST_ASSERT_TRUE(error[0] != '\0');
+
+    // HEAD must be unchanged after failed mixed reset
+    TEST_ASSERT_TRUE(git_read_head(&repo));
+    TEST_ASSERT_STREQ(repo.head_sha, original_head);
+
+    git_repo_close(&repo);
+    cleanup_reset_test_repo();
+}
