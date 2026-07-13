@@ -4,9 +4,9 @@
 // 1. ui_widgets_list.cpp - List Widget Components (line 12)
 // 2. FileListItem Widget (line 26)
 // 3. FileList Widget (line 435)
-// 4. BranchTreeItem Widget (line 1107)
-// 5. BranchTree Widget (line 1339)
-// 6. StashList Widget (line 1771)
+// 4. BranchTreeItem Widget (line 1131)
+// 5. BranchTree Widget (line 1363)
+// 6. StashList Widget (line 1792)
 //
 // </AUTO-GENERATED TOC>
 // ============================================================================
@@ -700,6 +700,27 @@ struct FileList : Widget {
         layout();
         set_dirty();
         return true;
+    }
+
+    // FileListItem widgets live in items[] only (not the parent/child tree), so
+    // EventDispatcher hit-tests this list as a leaf. Route double-click the same
+    // way as single-click: map Y → index and forward to the item.
+    bool on_double_click(float x, float y, int button) override {
+        if (collapsed) return false;
+        if (button != 0) return false;  // left button only
+
+        float item_height = Sidebar::FILE_ITEM_HEIGHT_V2;
+        float effective_scroll = external_scroll ? 0.0f : scroll_y;
+        int clicked_index = static_cast<int>((y + effective_scroll) / item_height);
+
+        if (clicked_index >= 0 && clicked_index < static_cast<int>(item_count)) {
+            FileListItem* item = items[clicked_index];
+            if (item) {
+                float item_local_y = item->rect.y - rect.y;
+                return item->on_double_click(x, y - item_local_y, button);
+            }
+        }
+        return false;
     }
 
     bool on_mouse_down(float x, float y, int button) override {
