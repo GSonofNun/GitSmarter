@@ -1024,6 +1024,7 @@ struct RepoLockGuard {
 // Git index entry (from .git/index)
 struct GitIndexEntry {
     uint32_t mode;
+    uint8_t stage;  // 0 = normal; 1/2/3 = unmerged conflict stages (flags bits 12-13)
     char sha[Git::SHA1_HEX_SIZE + 1];
     char path[Git::MAX_PATH_LEN];
 };
@@ -1043,6 +1044,7 @@ struct GitIndexEntryFull {
     uint32_t mode;
     uint32_t uid, gid;
     uint32_t file_size;
+    uint8_t stage;  // 0 = normal; 1/2/3 = unmerged conflict stages
     char sha[Git::SHA1_HEX_SIZE + 1];
     char path[Git::MAX_PATH_LEN];
 };

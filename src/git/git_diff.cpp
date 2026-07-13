@@ -198,7 +198,7 @@ bool git_index_get_sha(GitRepository* repo, const char* path, char* out_sha) {
 
     bool found = false;
     for (size_t i = 0; i < index.entry_count; i++) {
-        if (strcmp(index.entries[i].path, path) == 0) {
+        if (strcmp(index.entries[i].path, path) == 0 && index.entries[i].stage == 0) {
             strcpy_s(out_sha, Git::SHA1_HEX_SIZE + 1, index.entries[i].sha);
             found = true;
             break;
