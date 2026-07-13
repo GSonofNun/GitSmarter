@@ -4,6 +4,10 @@
 
 A fast, native Git client for Windows in a single ~2.5 MB executable.
 
+<p align="center">
+  <img src="docs/screenshots/gitsmarter-welcome.png" alt="GitSmarter welcome screen" width="800">
+</p>
+
 GitSmarter is written in C++20 and rendered entirely with Direct2D. It has no external runtime dependencies — no libgit2, no bundled git CLI, no Electron, no web view. It speaks Git natively: loose objects, pack files (`.idx`/`.pack`), delta resolution, the index, refs, and Smart HTTP Protocol v2 are all parsed and implemented directly. The result is a single small binary that holds its own against Git itself — cloning the Linux kernel (11.3M objects, 9.15M deltas, 6GB pack, 92K files) completes within 5% of the Git CLI's own time (289s vs 275s), using multithreaded lock-free delta resolution, memory-mapped I/O, and a sharded object cache.
 
 ## Features
